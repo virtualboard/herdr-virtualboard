@@ -252,3 +252,14 @@ func TestSessionFlagIsPrepended(t *testing.T) {
 		t.Fatalf("argv = %q", got)
 	}
 }
+
+func TestPanesRejectsIncompleteInventory(t *testing.T) {
+	for _, result := range []string{`{}`, `{"panes":null}`, `{"panes":[{}]}`, `{"panes":[{"pane_id":"same"},{"pane_id":"same"}]}`} {
+		t.Run(result, func(t *testing.T) {
+			client, _ := fakeHerdr(t, "echo '{\"id\":\"x\",\"result\":"+result+"}'")
+			if _, err := client.Panes(context.Background(), ""); err == nil {
+				t.Fatal("incomplete inventory accepted as authoritative")
+			}
+		})
+	}
+}

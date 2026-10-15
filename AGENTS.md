@@ -72,8 +72,8 @@ The surrounding code is the specification. Beyond that:
 - **Exit codes are the interface.** The first five mirror vb's own; 64 is anything hvb refused
   itself. Scripts branch on `$?`, so adding a code is a breaking change.
 - **Degrade rather than refuse.** A missing role charter weakens the prompt; it does not abort a run
-  whose agent is already live. A failed `pane rename` is cosmetic. An unreadable run file starts
-  clean. But an unsupported Herdr fails closed, because the alternative is an untrackable agent.
+  whose agent is already live. A failed `pane rename` is cosmetic. An unreadable run file is preserved and requires explicit `hvb run recover`;
+  a future schema requires a compatible binary. But an unsupported Herdr fails closed, because the alternative is an untrackable agent.
 - **No new dependencies without a strong reason.** The four current ones are cobra, toml, yaml, and
   `x/term`. The TUI is hand-drawn partly to keep it that way.
 

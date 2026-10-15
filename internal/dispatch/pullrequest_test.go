@@ -161,8 +161,8 @@ func TestDirtyWorktreeBlocksThePullRequest(t *testing.T) {
 	if pr.Pushed || pr.Opened {
 		t.Fatalf("a dirty worktree must not be published: %+v", pr)
 	}
-	if !strings.Contains(pr.Reason, "uncommitted") {
-		t.Errorf("Reason = %q", pr.Reason)
+	if !completion.Pending || !strings.Contains(completion.TransitionError, "commit") || completion.Moved != "" {
+		t.Errorf("dirty implementation must remain pending before publication or review: %+v", completion)
 	}
 }
 
@@ -241,5 +241,43 @@ func TestCleanupRefusesWhileTheRunIsActive(t *testing.T) {
 	h.worktreeRun(t, "main")
 	if _, err := h.dispatcher.CleanupWorktree(context.Background(), "r1", false); err == nil {
 		t.Fatal("cleanup should refuse while the run is still going")
+	}
+}
+
+func TestCleanupRefusesWhenGitCannotInspectCheckout(t *testing.T) {
+	h := newHarness(t, map[string]feature.Status{"FTR-0001": feature.InProgress}, noPanes)
+	h.worktreeRun(t, "main")
+	if _, err := h.dispatcher.Store.Finish("r1", runs.Succeeded, "success", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.dispatcher.CleanupWorktree(context.Background(), "r1", false); err == nil || !strings.Contains(err.Error(), "inspect worktree") {
+		t.Fatalf("cleanup did not fail closed: %v", err)
+	}
+}
+
+func TestCleanupMarksSharedHistoryAndStopsActiveRun(t *testing.T) {
+	h := newHarness(t, map[string]feature.Status{"FTR-0001": feature.InProgress}, noPanes)
+	first := h.worktreeRun(t, "main")
+	if _, err := h.dispatcher.Store.Finish(first.ID, runs.Succeeded, "success", ""); err != nil {
+		t.Fatal(err)
+	}
+	second := h.addRun("r2", "FTR-0001", feature.Review, runs.Running, "w1:p2")
+	if _, err := h.dispatcher.Store.Update(second.ID, func(r *runs.Run) error { wt := *first.Worktree; r.Worktree = &wt; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.dispatcher.CleanupWorktree(context.Background(), first.ID, true); err == nil {
+		t.Fatal("discarded a checkout shared by another active run")
+	}
+	if _, err := h.dispatcher.CleanupWorktree(context.Background(), second.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{first.ID, second.ID} {
+		run, err := h.dispatcher.Store.Get(id)
+		if err != nil || !run.Worktree.Removed {
+			t.Fatalf("stale checkout reference %s: %+v, %v", id, run, err)
+		}
+		if id == second.ID && run.State != runs.Cancelled {
+			t.Fatal("forced cleanup left its run active")
+		}
 	}
 }

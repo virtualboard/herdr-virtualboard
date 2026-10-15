@@ -110,7 +110,8 @@ type check struct {
 	Detail string `json:"detail"`
 	// Fatal marks a check whose failure stops hvb working at all, as
 	// opposed to one that only degrades it.
-	Fatal bool `json:"fatal"`
+	Fatal  bool   `json:"fatal"`
+	Remedy string `json:"remedy,omitempty"`
 }
 
 func newDoctorCommand(app *App) *cobra.Command {
@@ -133,12 +134,36 @@ does not stop dispatch, whereas an unsupported Herdr does.`,
 			} else {
 				checks = append(checks, check{Name: "workspace", OK: true,
 					Detail: app.Workspace().Root + " (" + app.Workspace().ID() + ")"})
-				checks = append(checks, check{Name: "run store", OK: true, Detail: app.Store().Path()})
+				_, storeErr := app.Store().List()
+				storeCheck := check{Name: "run store", OK: storeErr == nil, Detail: app.Store().Path(), Fatal: true}
+				if storeErr != nil {
+					storeCheck.Detail = storeErr.Error()
+					storeCheck.Remedy = "Preserve this file. Use a compatible hvb for newer formats; for corrupt data, inspect it before explicitly running hvb run recover."
+				}
+				checks = append(checks, storeCheck)
 				checks = append(checks, roleCheck(app))
 			}
 
-			checks = append(checks, vbCheck(app, ctx, workspaceErr == nil))
-			checks = append(checks, herdrCheck(app, ctx))
+			binaryCheck := vbCheck(app, ctx, workspaceErr == nil)
+			checks = append(checks, binaryCheck)
+			if workspaceErr == nil && binaryCheck.OK {
+				report, err := app.VB().Doctor(ctx, false)
+				if err != nil {
+					checks = append(checks, check{Name: "vb diagnostics", Fatal: true, Detail: err.Error(), Remedy: "Install a compatible vb CLI, then run vb doctor directly to inspect the workspace."})
+				} else {
+					if err := report.RequireDispatchCapabilities(); err != nil {
+						checks = append(checks, check{Name: "vb capabilities", Fatal: true, Detail: err.Error(), Remedy: "Install a vb CLI supporting ownership tokens, lease renewal, raw validation, and validation exit statuses."})
+					}
+					for _, entry := range report.Checks {
+						checks = append(checks, check{Name: "vb " + entry.Name, OK: entry.OK, Detail: entry.Detail, Fatal: entry.Fatal, Remedy: entry.Remedy})
+					}
+				}
+			}
+			herdrHealth := herdrCheck(app, ctx)
+			checks = append(checks, herdrHealth)
+			if workspaceErr == nil {
+				checks = append(checks, resourceChecks(ctx, app, herdrHealth.OK, binaryCheck.OK)...)
+			}
 			checks = append(checks, check{
 				Name:   "herdr pane",
 				OK:     herdrcli.InHerdr(),
@@ -166,6 +191,9 @@ does not stop dispatch, whereas an unsupported Herdr does.`,
 					}
 				}
 				app.Print("%s %-14s %s", mark, entry.Name, entry.Detail)
+				if !entry.OK && entry.Remedy != "" {
+					app.Print("  Remedy: %s", entry.Remedy)
+				}
 			}
 			if !healthy {
 				return errSilent{}

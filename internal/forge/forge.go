@@ -11,6 +11,7 @@ package forge
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/virtualboard/herdr-virtualboard/internal/git"
@@ -52,6 +53,9 @@ type Opener interface {
 
 // Options configure which openers are available.
 type Options struct {
+	// HTTPClient optionally supplies the REST transport (for example a custom
+	// proxy or an in-memory test handler). Nil uses the bounded default client.
+	HTTPClient *http.Client
 	// GitHubCLI is the `gh` executable; empty means "gh" on PATH.
 	GitHubCLI string
 	// Token authenticates the Forgejo and Gitea REST clients.
@@ -74,7 +78,7 @@ func For(remote git.Remote, opts Options) Opener {
 	case git.GitHub:
 		return &githubCLI{bin: opts.GitHubCLI}
 	case git.Forgejo, git.Gitea:
-		return &giteaAPI{token: opts.Token, baseURL: opts.BaseURL, kind: kind}
+		return &giteaAPI{token: opts.Token, baseURL: opts.BaseURL, kind: kind, client: opts.HTTPClient}
 	default:
 		return nil
 	}

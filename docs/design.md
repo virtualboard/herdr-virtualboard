@@ -26,10 +26,11 @@ That fact is machine-local, lives for minutes, and would be pure noise in a comm
 JSON file per project under `~/.local/share/herdr-virtualboard/runs/<project-id>.json`, keyed on the
 workspace's resolved absolute path.
 
-The run store is deliberately disposable. Delete it and you lose run history; the board itself is
-untouched, because the board is the repository. That is also why a corrupt run file starts clean
-instead of failing: runs are a convenience, and refusing to draw the board over a bad cache would be
-the wrong trade.
+The run store keeps execution evidence and recoverable completion phases, not a
+second copy of feature status. Corrupt bytes are preserved and reported, and
+`hvb run recover` explicitly quarantines them before starting an empty store.
+Future schemas require a compatible binary. Recovery can lose local run tracking,
+so inspect panes and worktrees rather than treating live resources as disposable.
 
 ## Why there is no daemon
 
@@ -138,3 +139,21 @@ The cost is that width arithmetic is hvb's problem. `displayWidth` skips SGR seq
 wide runes as two cells, and everything that lays anything out goes through it — an off-by-one there
 corrupts the surrounding Herdr pane, not just the board. Frames are diffed line by line so a refresh
 that moves one card repaints one row.
+
+## Keeping the board responsive
+
+The terminal loop owns all view state. One worker serializes backend reads,
+reconciliation, and actions, then returns frozen snapshots and UI continuations.
+Navigation, resize, search, and form entry continue while a command waits. Results
+preserve the selection at delivery time and never replace a form the user opened
+while the request was pending. At most one refresh and one action are outstanding;
+periodic refreshes coalesce instead of creating an unbounded queue.
+
+Filters and completed-card collapse operate only on the latest in-memory snapshot.
+They retain full board data and global run counts, while selection and actions use
+only matching, expanded cards. Background reloads rebuild that same filtered view.
+
+Quitting cancels I/O and gives context-aware operations a bounded cleanup interval.
+A failed dispatch stops its recorded pane before releasing the feature lease. If
+that cannot be confirmed, the active record stays available for reconciliation or
+explicit cancellation. This preserves the evidence needed to find a live writer.

@@ -44,10 +44,27 @@ type Error struct {
 	Code    int
 	Args    []string
 	Message string
+	Data    json.RawMessage
 }
 
 func (e *Error) Error() string {
-	return fmt.Sprintf("vb %s: %s (exit %d)", strings.Join(e.Args, " "), e.Message, e.Code)
+	args := append([]string(nil), e.Args...)
+	message := e.Message
+	for i, arg := range e.Args {
+		token := ""
+		if arg == "--token" && i+1 < len(args) {
+			token = e.Args[i+1]
+			args[i+1] = "[redacted]"
+		}
+		if value, ok := strings.CutPrefix(arg, "--token="); ok {
+			token = value
+			args[i] = "--token=[redacted]"
+		}
+		if token != "" {
+			message = strings.ReplaceAll(message, token, "[redacted]")
+		}
+	}
+	return fmt.Sprintf("vb %s: %s (exit %d)", strings.Join(args, " "), message, e.Code)
 }
 
 // Is lets errors.Is match the sentinel errors below by exit code.
@@ -82,7 +99,9 @@ type Client struct {
 	// Timeout bounds a single invocation. Zero means DefaultTimeout.
 	Timeout time.Duration
 	// DryRun adds `--dry-run`, which makes vb simulate without writing.
-	DryRun bool
+	DryRun     bool
+	Actor      string
+	LeaseToken string
 }
 
 // DefaultTimeout bounds one vb call. vb is a local file-manipulating CLI; a
@@ -130,7 +149,11 @@ func (c *Client) run(ctx context.Context, args ...string) (*Envelope, error) {
 		return nil, fmt.Errorf("vb %s: decode JSON response: %w", strings.Join(args, " "), err)
 	}
 	if !envelope.Success {
-		return nil, &Error{Code: ExitUnknown, Args: args, Message: envelope.Message}
+		code := ExitUnknown
+		if len(args) > 0 && args[0] == "validate" {
+			code = ExitValidation
+		}
+		return nil, &Error{Code: code, Args: args, Message: envelope.Message, Data: envelope.Data}
 	}
 	return &envelope, nil
 }
@@ -157,6 +180,15 @@ func (c *Client) raw(ctx context.Context, args ...string) ([]byte, error) {
 	full = append(full, args...)
 
 	cmd := exec.CommandContext(ctx, c.bin(), full...)
+	if c.Actor != "" {
+		cmd.Env = append(os.Environ(), "VB_OWNER="+c.Actor)
+	}
+	if c.LeaseToken != "" {
+		if cmd.Env == nil {
+			cmd.Env = os.Environ()
+		}
+		cmd.Env = append(cmd.Env, "VB_LOCK_TOKEN="+c.LeaseToken)
+	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -173,6 +205,10 @@ func (c *Client) raw(ctx context.Context, args ...string) ([]byte, error) {
 	}
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
+		var envelope Envelope
+		if json.Unmarshal(stdout.Bytes(), &envelope) == nil && !envelope.Success && envelope.Data != nil {
+			return nil, &Error{Code: exitErr.ExitCode(), Args: full, Message: envelope.Message, Data: envelope.Data}
+		}
 		message := strings.TrimSpace(stderr.String())
 		if message == "" {
 			message = strings.TrimSpace(stdout.String())

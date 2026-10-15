@@ -129,7 +129,7 @@ type confirmation struct {
 func (m *Model) overlay(background []string) []string {
 	var box []string
 	switch m.view {
-	case ViewNewFeature:
+	case ViewNewFeature, ViewFilters:
 		box = m.renderForm()
 	case ViewMovePicker, ViewDispatchPicker:
 		box = m.renderPicker()
@@ -281,7 +281,11 @@ func (m *Model) renderForm() []string {
 	if m.form.err != "" {
 		out = append(out, m.boxRow("", width), m.boxRow(paint(m.palette.Warn, m.form.err), width))
 	}
-	return append(out, m.boxBottom("tab field · ←→ cycle · ⏎ create · esc cancel", width)...)
+	hint := "tab field · ←→ cycle · ⏎ create · esc cancel"
+	if m.view == ViewFilters {
+		hint = "tab field · ⏎ apply · esc cancel"
+	}
+	return append(out, m.boxBottom(hint, width)...)
 }
 
 func (m *Model) renderConfirm() []string {

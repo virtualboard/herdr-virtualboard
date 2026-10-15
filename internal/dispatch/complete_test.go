@@ -52,7 +52,7 @@ func newHarness(t *testing.T, statuses map[string]feature.Status, herdrScript st
 	if err != nil {
 		t.Fatal(err)
 	}
-	vbClient, vbArgv := stub(t, "vb", `echo '{"success":true,"message":"ok","data":{"id":"x","status":"","owner":"","path":"","summary":""}}'`)
+	vbClient, vbArgv := stub(t, "vb", dispatchPreflightVB+`echo '{"success":true,"message":"ok","data":{"id":"x","status":"","owner":"","path":"","summary":""}}'`)
 	herdrBin, _ := stub(t, "herdr", herdrScript)
 
 	t.Setenv("HVB_DATA_DIR", t.TempDir())
@@ -344,3 +344,21 @@ func assertVBCalled(t *testing.T, argv []string, want string) {
 	}
 	t.Fatalf("vb was never called with %q; calls were:\n  %s", want, strings.Join(argv, "\n  "))
 }
+
+// Read the fixture's actual lifecycle so a canned success cannot conceal a stale
+// target. Other commands still use each test's mutation/failure behavior.
+const dispatchPreflightVB = `case "$*" in
+ *"doctor --capabilities-only"*) echo '{"success":true,"data":{"format_version":1,"ok":true,"version":"test","capabilities":["owner-leases","lease-tokens","lease-renewal","raw-schema-validation","validation-exit-status"],"checks":[{"name":"runtime","ok":true,"fatal":false,"detail":"test runtime"}]}}'; exit 0 ;;
+ *"validate "*)
+  root=""; id=""
+  while [ "$#" -gt 0 ]; do
+   case "$1" in --root) root="$2"; shift ;; validate) id="$2"; shift ;; esac
+   shift
+  done
+  path="$(find "$root/.virtualboard/features" -name "$id*.md" | head -1)"
+  [ -n "$path" ] || exit 2
+  status="$(sed -n 's/^status: //p' "$path" | head -1)"
+  printf '{"success":true,"data":{"id":"%s","status":"%s","errors":[]}}\n' "$id" "$status"
+  exit 0 ;;
+esac
+`

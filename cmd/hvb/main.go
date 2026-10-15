@@ -11,7 +11,7 @@ import (
 	"github.com/virtualboard/herdr-virtualboard/internal/cli"
 )
 
-// version is set by the linker: -ldflags "-X main.version=0.1.0".
+// version is set by the linker: -ldflags "-X main.version=0.2.0".
 var version = "dev"
 
 func main() {

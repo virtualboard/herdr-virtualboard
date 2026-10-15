@@ -20,6 +20,31 @@ assert_exit 0 "a healthy environment exits 0" -- hvb doctor
 out="$(hvb --json doctor 2>&1)"
 assert_contains "$out" '"ok": true' "--json reports overall health"
 
+# An incompatible vb cannot replace a currently running agent, even with force.
+hvb --json run start FTR-0001 > "$STUBS/started.json"
+store="$(find "$HVB_DATA_DIR/runs" -name '*.json' | head -1)"
+cp "$store" "$STUBS/store-before-vb-check.json"
+cp "$STUBS/vb" "$STUBS/vb-compatible"
+cat > "$STUBS/vb" <<'OLDVB'
+#!/usr/bin/env bash
+case "$*" in
+ *version*) echo v0.9.1 ;;
+ *doctor*) echo 'unknown command doctor' >&2; exit 1 ;;
+ *) echo 'unexpected mutation via old vb' >&2; exit 99 ;;
+esac
+OLDVB
+chmod +x "$STUBS/vb"
+assert_exit 1 "an incompatible vb cannot force-replace an active run" -- hvb run start FTR-0001 --force
+if cmp -s "$store" "$STUBS/store-before-vb-check.json"; then
+  pass "compatibility refusal preserves the active run record"
+else
+  fail "compatibility refusal changed the active run record"
+fi
+mv "$STUBS/vb-compatible" "$STUBS/vb"
+# Finish this scratch run before the independent Herdr-gate check below.
+run_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "$STUBS/started.json")"
+hvb run cancel "$run_id" >/dev/null
+
 # An unsupported Herdr must fail the gate rather than dispatch into it.
 cat > "$STUBS/herdr" <<'STUB'
 #!/usr/bin/env bash

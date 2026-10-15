@@ -30,6 +30,8 @@ type Backend interface {
 	DispatchWith(ctx context.Context, spec *feature.Spec, role, kind string, worktree, pr *bool) (*runs.Run, error)
 	Cancel(ctx context.Context, runID string) error
 	Focus(ctx context.Context, runID string) error
+	// Metadata accessors must remain memory-only: rendering calls them on
+	// the UI goroutine. Put potentially blocking I/O in Load or an action.
 	Roles() []roles.Role
 	Config() *config.Config
 	Owner() string
@@ -52,6 +54,7 @@ const (
 	ViewDetail
 	ViewHelp
 	ViewNewFeature
+	ViewFilters
 	ViewMovePicker
 	ViewDispatchPicker
 	ViewConfirm
@@ -68,7 +71,11 @@ type Model struct {
 	view View
 
 	// columns holds the cards per status, in board order.
-	columns map[feature.Status][]*Card
+	columns       map[feature.Status][]*Card
+	allColumns    map[feature.Status][]*Card
+	matchedCounts map[feature.Status]int
+	filters       boardFilters
+	hideDone      bool
 	// column and card are the focused positions.
 	column int
 	card   map[feature.Status]int
@@ -78,6 +85,7 @@ type Model struct {
 	statusAt time.Time
 	isError  bool
 
+	helpScroll    int
 	detailScroll  int
 	detailSection int
 
@@ -85,8 +93,13 @@ type Model struct {
 	picker  *picker
 	confirm *confirmation
 
-	lastLoad time.Time
-	quitting bool
+	enqueue      func(task) bool
+	loading      bool
+	pendingLabel string
+	failedForm   *form
+	inputContext context.Context
+	lastLoad     time.Time
+	quitting     bool
 }
 
 // NewModel builds a board over a backend.
@@ -112,13 +125,21 @@ func (m *Model) Resize(width, height int) {
 // because another agent finished a feature is how a user dispatches the wrong
 // thing.
 func (m *Model) Reload(ctx context.Context) {
+	if m.enqueue != nil {
+		m.requestReload()
+		return
+	}
+	m.applySnapshot(loadSnapshot(ctx, m.backend))
+}
+
+func (m *Model) applySnapshot(snapshot boardSnapshot) {
 	focused := m.FocusedCard()
 	var focusedID string
 	if focused != nil {
 		focusedID = focused.Spec.ID
 	}
 
-	specs, allRuns, problems := m.backend.Load(ctx)
+	specs, allRuns, problems := snapshot.specs, snapshot.runs, snapshot.problems
 	m.problems = problems
 
 	runsByFeature := map[string][]*runs.Run{}
@@ -137,7 +158,8 @@ func (m *Model) Reload(ctx context.Context) {
 		}
 		columns[spec.Status] = append(columns[spec.Status], card)
 	}
-	m.columns = columns
+	m.allColumns = columns
+	m.rebuildFiltered()
 	first := m.lastLoad.IsZero()
 	m.lastLoad = time.Now()
 
@@ -226,7 +248,7 @@ func (m *Model) Cards(status feature.Status) []*Card { return m.columns[status] 
 func (m *Model) Counts() map[feature.Status]int {
 	out := map[feature.Status]int{}
 	for _, status := range feature.Statuses {
-		out[status] = len(m.columns[status])
+		out[status] = m.matchedCounts[status]
 	}
 	return out
 }
@@ -235,7 +257,7 @@ func (m *Model) Counts() map[feature.Status]int {
 func (m *Model) ActiveRunCount() int {
 	count := 0
 	for _, status := range feature.Statuses {
-		for _, card := range m.columns[status] {
+		for _, card := range m.allColumns[status] {
 			if card.Active != nil {
 				count++
 			}
@@ -306,13 +328,15 @@ func NewBackend(
 }
 
 func (b *liveBackend) Load(ctx context.Context) ([]*feature.Spec, []*runs.Run, []error) {
-	specs, problems := b.workspace.LoadSpecs()
+	var problems []error
 	// Reconciling before reading is what keeps the board honest without a
 	// daemon: a run whose pane closed is settled here, not left showing as
 	// live until someone notices.
 	if _, err := b.dispatcher.Reconcile(ctx); err != nil {
 		problems = append(problems, err)
 	}
+	specs, specProblems := b.workspace.LoadSpecs()
+	problems = append(problems, specProblems...)
 	allRuns, err := b.store.List()
 	if err != nil {
 		problems = append(problems, err)
@@ -326,6 +350,9 @@ func (b *liveBackend) Move(ctx context.Context, id string, target feature.Status
 	}
 	if err := b.vb.Index(ctx); err != nil {
 		return fmt.Errorf("moved %s, but the index is stale: %w", id, err)
+	}
+	if _, err := b.dispatcher.AutoStart(ctx, id); err != nil {
+		return fmt.Errorf("moved %s, but automatic dispatch failed: %w", id, err)
 	}
 	return nil
 }

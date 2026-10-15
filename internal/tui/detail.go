@@ -161,7 +161,7 @@ func (m *Model) detailLines(card *Card, width int) []string {
 }
 
 // renderHelp draws the key reference and the environment summary.
-func (m *Model) renderHelp() []string {
+func (m *Model) helpLines() []string {
 	inner := m.width - 2
 	var out []string
 	add := func(format string, args ...any) {
@@ -182,6 +182,11 @@ func (m *Model) renderHelp() []string {
 	key("↑ ↓ k j", "focus card")
 	key("⏎", "card detail")
 	key("esc q", "back, then quit")
+
+	section("Finding work")
+	key("/ f", "search ID, title or body; filter by owner and labels")
+	key("c", "clear search and filters")
+	key("D", "collapse or expand completed cards")
 
 	section("Changing the board")
 	key("n", "new feature in backlog")
@@ -279,4 +284,11 @@ func orDash(value string) string {
 		return "—"
 	}
 	return value
+}
+
+func (m *Model) renderHelp() []string {
+	lines := m.helpLines()
+	limit := max(0, len(lines)-(m.height-2))
+	start := min(max(m.helpScroll, 0), limit)
+	return lines[start:]
 }

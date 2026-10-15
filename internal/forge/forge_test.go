@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/virtualboard/herdr-virtualboard/internal/git"
 )
@@ -64,20 +65,28 @@ func TestForgejoOpensAPullRequest(t *testing.T) {
 	var gotPath, gotAuth string
 	var gotBody map[string]any
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	client := handlerClient(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s", r.Method)
+		}
+		if r.URL.Scheme != "https" || r.URL.Host != "forgejo.example" {
+			t.Errorf("endpoint = %s", r.URL)
+		}
+		if r.Header.Get("Content-Type") != "application/json" || r.Header.Get("Accept") != "application/json" {
+			t.Errorf("headers = %v", r.Header)
+		}
 		gotPath, gotAuth = r.URL.Path, r.Header.Get("Authorization")
 		_ = json.NewDecoder(r.Body).Decode(&gotBody)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
 		_, _ = w.Write([]byte(`{"number":42,"html_url":"https://forgejo.example/org/repo/pulls/42"}`))
 	}))
-	defer server.Close()
 
 	result := Open(context.Background(), Request{
 		Remote: remote(t, "ssh://git@forgejo.example:2222/org/repo.git"),
 		Base:   "main", Head: "feature/FTR-0001/x",
 		Title: "FTR-0001: Add retry", Body: "body text",
-	}, Options{Token: "secret", BaseURL: server.URL})
+	}, Options{Token: "secret", HTTPClient: client})
 
 	if !result.Opened {
 		t.Fatalf("Opened = false, reason %q", result.Reason)
@@ -100,17 +109,16 @@ func TestForgejoOpensAPullRequest(t *testing.T) {
 // draft as a WIP title prefix.
 func TestForgejoDraftBecomesAWIPTitle(t *testing.T) {
 	var gotBody map[string]any
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	client := handlerClient(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewDecoder(r.Body).Decode(&gotBody)
 		w.WriteHeader(http.StatusCreated)
 		_, _ = w.Write([]byte(`{"number":1,"html_url":"u"}`))
 	}))
-	defer server.Close()
 
 	Open(context.Background(), Request{
 		Remote: remote(t, "https://gitea.example/org/repo.git"),
 		Base:   "main", Head: "topic", Title: "FTR-0001: thing", Draft: true,
-	}, Options{Token: "t", BaseURL: server.URL})
+	}, Options{Token: "t", HTTPClient: client})
 
 	if title, _ := gotBody["title"].(string); !strings.HasPrefix(title, "WIP: ") {
 		t.Fatalf("draft title = %q, want a WIP prefix", title)
@@ -121,15 +129,14 @@ func TestForgejoDraftBecomesAWIPTitle(t *testing.T) {
 }
 
 func TestForgejoRejectedTokenDegrades(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	client := handlerClient(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
 	}))
-	defer server.Close()
 
 	result := Open(context.Background(), Request{
 		Remote: remote(t, "https://forgejo.example/org/repo.git"),
 		Base:   "main", Head: "topic",
-	}, Options{Token: "bad", BaseURL: server.URL})
+	}, Options{Token: "bad", HTTPClient: client})
 
 	if result.Opened {
 		t.Fatal("a rejected token cannot have opened anything")
@@ -144,15 +151,14 @@ func TestForgejoRejectedTokenDegrades(t *testing.T) {
 
 // An existing pull request is a success for hvb's purposes, not a failure.
 func TestForgejoConflictCountsAsOpened(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	client := handlerClient(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusConflict)
 	}))
-	defer server.Close()
 
 	result := Open(context.Background(), Request{
 		Remote: remote(t, "https://forgejo.example/org/repo.git"),
 		Base:   "main", Head: "topic",
-	}, Options{Token: "t", BaseURL: server.URL})
+	}, Options{Token: "t", HTTPClient: client})
 
 	if !result.Opened {
 		t.Fatalf("a conflict means one already exists: %+v", result)
@@ -284,4 +290,24 @@ func TestBodyCarriesTheReviewersContext(t *testing.T) {
 			t.Errorf("body is missing %q:\n%s", want, body)
 		}
 	}
+}
+
+// Exercise the real HTTP client, request creation, handler and response decoding
+// without opening sockets or changing http.DefaultTransport. These tests cover
+// application HTTP behavior; they do not claim to test TCP or TLS negotiation.
+type handlerTransport struct{ handler http.Handler }
+
+func (h handlerTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if err := request.Context().Err(); err != nil {
+		return nil, err
+	}
+	recorder := httptest.NewRecorder()
+	h.handler.ServeHTTP(recorder, request)
+	response := recorder.Result()
+	response.Request = request
+	return response, nil
+}
+
+func handlerClient(handler http.Handler) *http.Client {
+	return &http.Client{Transport: handlerTransport{handler: handler}, Timeout: time.Second}
 }

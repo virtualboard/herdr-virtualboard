@@ -113,19 +113,29 @@ var labelHints = []struct {
 // Suggest picks the role that best fits a feature, given the roles the
 // workspace actually ships.
 //
-// Precedence: an explicit `role:` label wins, then the first label that matches
-// a hint, then the status default (review is QA's), then fallback. The result's
+// Precedence: the explicit role field, then a legacy `role:` label, then QA for
+// review, then the first matching label hint, then fallback. The result's
 // second value is false when no role could be resolved at all.
 func Suggest(all []Role, spec *feature.Spec, fallback string) (Role, bool) {
 	if len(all) == 0 {
 		return Role{}, false
 	}
 	if spec != nil {
+		if spec.Role != "" {
+			if role, found := Find(all, spec.Role); found {
+				return role, true
+			}
+		}
 		for _, label := range spec.Labels {
 			if rest, ok := strings.CutPrefix(label, "role:"); ok {
 				if role, found := Find(all, rest); found {
 					return role, true
 				}
+			}
+		}
+		if spec.Status == feature.Review {
+			if role, found := Find(all, "qa"); found {
+				return role, true
 			}
 		}
 		for _, label := range spec.Labels {
@@ -138,13 +148,6 @@ func Suggest(all []Role, spec *feature.Spec, fallback string) (Role, bool) {
 						return role, true
 					}
 				}
-			}
-		}
-		// A feature in review is being checked, not built, whatever its
-		// labels say about the work that produced it.
-		if spec.Status == feature.Review {
-			if role, found := Find(all, "qa"); found {
-				return role, true
 			}
 		}
 	}

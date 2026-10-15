@@ -235,6 +235,16 @@ func (c *Client) Panes(ctx context.Context, workspaceID string) ([]Pane, error) 
 	if err := c.call(ctx, &result, args...); err != nil {
 		return nil, err
 	}
+	if result.Panes == nil {
+		return nil, errors.New("Herdr pane list omitted its panes array")
+	}
+	seen := map[string]bool{}
+	for _, pane := range result.Panes {
+		if pane.PaneID == "" || seen[pane.PaneID] {
+			return nil, errors.New("Herdr pane list returned empty or duplicate pane IDs")
+		}
+		seen[pane.PaneID] = true
+	}
 	return result.Panes, nil
 }
 

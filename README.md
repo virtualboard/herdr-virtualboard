@@ -37,7 +37,7 @@ every change back through `vb`:
   blocked`. An agent reporting success moves its feature to the column's success route; failure and
   blocked route to theirs. hvb never invents a transition VirtualBoard forbids.
 - **No daemon, no database.** The only state hvb owns is which pane is running which feature, in one
-  JSON file per project. Delete it and you lose run history, nothing else.
+  JSON file per project. Corrupt state is preserved for explicit recovery; feature specs remain in the repository.
 - **One binary.** `hvb` is the TUI, the CLI you drive by hand, and the CLI dispatched agents report
   through.
 
@@ -54,7 +54,7 @@ herdr plugin action invoke open-virtualboard --plugin herdr-virtualboard
 ```
 
 Requirements: **Herdr 0.9.0** (socket protocol 22), the [`vb`
-CLI](https://github.com/virtualboard/vb-cli), a Go toolchain for the install-time build, and a
+CLI](https://github.com/virtualboard/vb-cli) with ownership-token, lease-renewal, raw-validation, and validation-exit-status capabilities, a Go toolchain for the install-time build, and a
 VirtualBoard workspace (`vb init`). Linux and macOS.
 
 <details>
@@ -105,10 +105,29 @@ hvb never installs an integration itself — that writes into your harness's per
 | `H` `L` | shift one column | `e` | set priority |
 | `d` | **dispatch an agent** | `o` | focus the running agent's pane |
 | `x` | cancel the active run | `r` | refresh |
-| `?` | help | | |
+| `/` `f` | search and owner/label filters | `c` | clear filters |
+| `D` | collapse/expand completed cards | `?` | scrollable help |
 
 The board reloads every few seconds, so a teammate's `vb move` or another agent finishing shows up
-without you asking. Below about 108 columns it switches to a single-column layout with a lifecycle
+without you asking. Refreshes and commands run in the background: you can navigate,
+resize, search, or quit while they finish. The footer shows pending work, and the
+board accepts one action at a time so repeated keys do not dispatch duplicate agents.
+A refresh keeps the selected feature and any text in an open form.
+
+Press `/` or `f` to search feature IDs, titles, bodies, owners, and labels. Search
+words must all match. The owner field matches an exact handle; `unassigned` includes
+empty owners. Enter space-separated labels to require every label. Press Enter to
+apply or Escape to discard edits; `c` clears applied filters. The matching count remains visible
+against the complete board, in the header or compact footer. `D` hides completed cards while keeping
+their count visible; press it again to expand them. These view settings persist
+through refreshes for the current session and do not change feature files.
+
+![Search and owner/label filters](docs/assets/filters.png)
+
+[Completed-card collapse preview](docs/assets/completed-collapsed.png)
+
+Help supports arrows, Page Up/Down, Home, and End, including on short terminals.
+Below about 108 columns it switches to a single-column layout with a lifecycle
 breadcrumb, so it stays usable in a narrow split or on a phone.
 
 ### Starting work
@@ -167,8 +186,8 @@ ready. It never answers that dialog for you.
 ### Dispatching
 
 Pressing `d` on a card opens the role picker, pre-selected from the feature's labels — `backend`
-suggests `backend_dev`, `ui` suggests `frontend_dev`, anything in review suggests `qa`. A `role:`
-label overrides the guess entirely. Then hvb:
+suggests `backend_dev`, `ui` suggests `frontend_dev`, anything in review suggests `qa`. A dedicated `role` field overrides label suggestions; a legacy `role:` label is
+also supported. Column policy can select a role, including QA for review. Then hvb:
 
 1. takes the feature's `vb` lock for the configured owner,
 2. opens or reuses the feature's `ftr-####` Herdr tab,
@@ -204,7 +223,7 @@ script can parse stdout unconditionally.
 | Noun | Verbs |
 |---|---|
 | `hvb feature` | `list`, `show`, `new`, `move`, `set`, `note`, `delete`, `validate` |
-| `hvb run` | `start`, `list`, `show`, `done`, `comment`, `cancel`, `focus`, `log`, `cleanup` |
+| `hvb run` | `start`, `list`, `show`, `done`, `retry`, `recover`, `comment`, `cancel`, `focus`, `log`, `cleanup` |
 | `hvb role` | `list`, `show` |
 | `hvb harness` | `list` |
 | `hvb tui` · `hvb doctor` · `hvb skill` · `hvb version` | |
@@ -301,6 +320,12 @@ make e2e        # end-to-end only
 The e2e suite is hermetic: stub `vb` and `herdr` binaries mean it never touches your Herdr session,
 never starts an agent, and never makes a provider call.
 
+Releases use immutable `v*` tags matching `VERSION`. The release workflow runs
+the full gates, then checks real-binary integration against the exact refs in
+`.github/release-versions` before building platform binaries and checksums.
+Publish `vb-cli` first, then `template-base`, and release this plugin after both
+dependencies are available. Never move or reuse a published tag.
+
 - [`docs/worktrees.md`](docs/worktrees.md) — worktree dispatch, pull requests, and testing both locally
 - [`docs/design.md`](docs/design.md) — why there is no daemon, and what hvb does own
 - [`docs/herdr.md`](docs/herdr.md) — the verified Herdr contract, and how to re-verify it
@@ -320,3 +345,46 @@ never starts an agent, and never makes a provider call.
 ## Licence
 
 MIT. See [LICENSE](LICENSE).
+
+### Read-only diagnostics
+
+Run `hvb doctor` (or `hvb --json doctor`) to check Herdr compatibility, role
+charters, the actual run-store contents, and workspace health reported by
+`vb doctor`. Blocking checks exit 1 and include remedies. A compatible `vb` with
+the versioned doctor report is required for these workspace checks. An older
+binary is reported as incompatible rather than assumed healthy. Reading an absent
+run store creates no directories; diagnostics preserve corrupt or future-version
+stores for explicit recovery and never release leases or repair project files.
+
+Doctor also compares active runs with Herdr panes and leases, checks retained
+checkout paths against Git worktree registrations, and flags unfinished completion
+steps. Unrecorded feature-labelled panes are scoped to this project and retained
+checkouts; historical panes remain legitimate. An untracked feature/review branch
+may belong to standalone work. Warnings suggest inspection, explicit cancellation,
+retry, or cleanup; doctor performs none of those actions and prints no lease tokens.
+
+Dispatch checks Herdr and `vb doctor --capabilities-only` before replacing a run,
+claiming a lease, or launching an agent. It validates the selected feature before
+replacement and again after acquiring its lease. Invalid, completed, changed, or
+unconfirmed targets are refused; unrelated invalid features do not block a valid
+target. `--force` does not bypass compatibility or specification validation.
+
+The shared `testdata/workflow-contract.json` fixture pins lifecycle, role-selection,
+and CLI interfaces alongside template-base and vb-cli. Unit tests check the actual
+implementations; real-binary integration exercises every lifecycle pair through
+both CLIs. See [testing](docs/testing.md#shared-workflow-contract) for synchronization
+and verification commands.
+
+### Awaiting runs and lease cleanup
+
+An `awaiting` run keeps its observed outcome and feature status while releasing
+its lease. Release failures remain pending in the run record and are retried on
+refresh, including after restart; an already settled awaiting run is not renewed
+or stopped again. Doctor reports unconfirmed cleanup.
+
+A later `hvb run done RUN-ID` obtains fresh ownership before applying a human's
+outcome. It waits for other owners and never forces their leases. Cancelling an
+older run or finishing already-routed effects preserves a successor's lease.
+Incomplete run-store objects and invalid records are preserved until explicit
+`hvb run recover`; supported v1 stores remain readable, and newer formats require
+a compatible binary. Recovery retains the original bytes in quarantine.

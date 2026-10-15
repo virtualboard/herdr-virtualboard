@@ -103,6 +103,15 @@ func (a *App) Resolve() error {
 
 	a.workspace, a.config, a.store, a.roles, a.herdr = resolved, cfg, store, loadedRoles, herdr
 	a.vb = vb.New(resolved.Root)
+	a.vb.Actor = cfg.ResolveOwner()
+	if runID := os.Getenv("HVB_RUN_ID"); runID != "" {
+		if run, err := store.Get(runID); err == nil {
+			a.vb.LeaseToken = run.LockToken
+			if run.LockOwner != "" {
+				a.vb.Actor = run.LockOwner
+			}
+		}
+	}
 	return nil
 }
 

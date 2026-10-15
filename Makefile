@@ -7,8 +7,9 @@ GO       ?= go
 BIN      := bin/hvb
 VERSION  := $(shell cat VERSION 2>/dev/null || echo dev)
 LDFLAGS  := -s -w -X main.version=$(VERSION)
+TEMPLATE_SOURCE ?= ../template-base
 
-.PHONY: all build install clean fmt fmt-check vet test test-race cover e2e gates sync-skill tidy help
+.PHONY: all build install clean fmt fmt-check vet test test-race cover e2e gates integration sync-skill tidy help
 
 all: build
 
@@ -51,6 +52,12 @@ cover:
 ## e2e: run the end-to-end suite against stub vb and herdr binaries
 e2e: build
 	@./e2e/run-all.sh
+
+## integration: real vb + hvb + sibling template contracts and report catalog
+integration: build
+	@test -n "$(VB_REAL_BIN)" || { echo "Set VB_REAL_BIN to the real vb binary under test" >&2; exit 1; }
+	@TEMPLATE_SOURCE="$(TEMPLATE_SOURCE)" VB_REAL_BIN="$(VB_REAL_BIN)" HVB_BIN="$(CURDIR)/$(BIN)" bash integration/contracts.sh
+	@TEMPLATE_SOURCE="$(TEMPLATE_SOURCE)" VB_REAL_BIN="$(VB_REAL_BIN)" bash integration/reports.sh
 
 ## sync-skill: copy the published contract into the embedded one
 sync-skill:

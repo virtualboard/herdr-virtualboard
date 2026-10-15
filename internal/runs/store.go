@@ -9,6 +9,7 @@
 package runs
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -70,6 +71,17 @@ type Run struct {
 	PaneID      string `json:"pane_id,omitempty"`
 	AnchorPane  string `json:"anchor_pane,omitempty"`
 	AgentName   string `json:"agent_name,omitempty"`
+	LockToken   string `json:"lock_token,omitempty"`
+	LockOwner   string `json:"lock_owner,omitempty"`
+	// LeaseReleased records confirmed absence of this run's lease, including
+	// awaiting runs that remain available for a later human outcome.
+	LeaseReleased bool                `json:"lease_released,omitempty"`
+	Completion    *CompletionProgress `json:"completion,omitempty"`
+	Revision      *Revision           `json:"revision,omitempty"`
+	ReviewOf      *Revision           `json:"review_of,omitempty"`
+	AutoParentID  string              `json:"auto_parent_id,omitempty"`
+	AutoChildID   string              `json:"auto_child_id,omitempty"`
+	AutoDepth     int                 `json:"auto_depth,omitempty"`
 
 	// PendingPrompt is the prompt hvb has not been able to submit yet,
 	// because the harness was blocked on its own startup UI. Reconcile
@@ -130,7 +142,32 @@ type Comment struct {
 }
 
 // Active reports whether the run still occupies a pane hvb should watch.
-func (r *Run) Active() bool { return !r.State.Terminal() }
+func (r *Run) Active() bool {
+	return !r.State.Terminal() || (r.Completion != nil && !r.Completion.Done)
+}
+
+// CompletionProgress records which effects of an accepted outcome reached the
+// outside world. The outcome survives failures; unfinished effects can resume.
+type CompletionProgress struct {
+	Cancelled   bool   `json:"cancelled,omitempty"`
+	AutoChecked bool   `json:"auto_checked"`
+	Captured    bool   `json:"captured"`
+	Target      string `json:"target,omitempty"`
+	Published   bool   `json:"published"`
+	Linked      bool   `json:"linked"`
+	Routed      bool   `json:"routed"`
+	Indexed     bool   `json:"indexed"`
+	Released    bool   `json:"released"`
+	Done        bool   `json:"done"`
+	LastError   string `json:"last_error,omitempty"`
+}
+
+// Revision is an immutable Git handoff, not a cached feature fact.
+type Revision struct {
+	Commit     string `json:"commit"`
+	Branch     string `json:"branch"`
+	Repository string `json:"repository"`
+}
 
 // Duration is how long the run has been going, or how long it took.
 func (r *Run) Duration() time.Duration {
@@ -148,9 +185,8 @@ type document struct {
 }
 
 // version is the run-file schema version. Bump it when the shape changes in a
-// way an older hvb would misread; Load discards a file from the future rather
-// than guessing at it.
-const version = 1
+// way an older hvb would misread; reads preserve and reject unsupported formats.
+const version = 2
 
 // MaxRunsPerFeature caps retained history per feature. Older terminal runs are
 // pruned on save so a long-lived board does not grow without bound.
@@ -183,16 +219,14 @@ func DataDir() (string, error) {
 }
 
 // Open returns the run store for a project, keyed by the workspace identity so
-// two checkouts of the same repository keep separate histories.
+// two checkouts of the same repository keep separate histories. Opening and
+// reading an absent store do not create directories; only mutations do.
 func Open(projectID string) (*Store, error) {
 	dir, err := DataDir()
 	if err != nil {
 		return nil, err
 	}
 	runsDir := filepath.Join(dir, "runs")
-	if err := os.MkdirAll(runsDir, 0o700); err != nil {
-		return nil, fmt.Errorf("create run directory: %w", err)
-	}
 	return &Store{path: filepath.Join(runsDir, projectID+".json")}, nil
 }
 
@@ -330,21 +364,20 @@ func (s *Store) mutate(apply func(*document) error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	unlock, err := s.lockFile()
-	if err != nil {
-		return err
-	}
-	defer unlock()
-
-	doc, err := s.load()
-	if err != nil {
-		return err
-	}
-	if err := apply(doc); err != nil {
-		return err
-	}
-	prune(doc)
-	return s.save(doc)
+	return withOSLock(context.Background(), s.path+".mutex", func() error {
+		doc, err := s.load()
+		if err != nil {
+			return err
+		}
+		if err := apply(doc); err != nil {
+			return err
+		}
+		if err := validateDocument(doc); err != nil {
+			return fmt.Errorf("refuse invalid run store mutation: %w", err)
+		}
+		prune(doc)
+		return s.save(doc)
+	})
 }
 
 func (s *Store) load() (*document, error) {
@@ -355,17 +388,11 @@ func (s *Store) load() (*document, error) {
 		}
 		return nil, fmt.Errorf("read run store: %w", err)
 	}
-	var doc document
-	if err := json.Unmarshal(raw, &doc); err != nil {
-		// A corrupt run file must not make the board unusable: runs are a
-		// convenience, the repository is the truth. Start clean and say so.
-		return &document{Version: version}, nil
+	doc, err := decodeDocument(raw)
+	if err != nil {
+		return nil, fmt.Errorf("run store %s cannot be read; preserve it and inspect hvb doctor before explicit recovery: %w", s.path, err)
 	}
-	if doc.Version > version {
-		return &document{Version: version}, nil
-	}
-	doc.Version = version
-	return &doc, nil
+	return doc, nil
 }
 
 func (s *Store) save(doc *document) error {
@@ -397,39 +424,6 @@ func (s *Store) save(doc *document) error {
 	return nil
 }
 
-// lockFile takes a cross-process advisory lock by exclusive-create, retrying
-// briefly. Every writer holds it for a single read-modify-write, so waiting is
-// short; a lock older than lockStale is treated as abandoned.
-func (s *Store) lockFile() (func(), error) {
-	path := s.path + ".lock"
-	deadline := time.Now().Add(lockWait)
-	for {
-		file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-		if err == nil {
-			fmt.Fprintf(file, "%d\n", os.Getpid())
-			file.Close()
-			return func() { os.Remove(path) }, nil
-		}
-		if !os.IsExist(err) {
-			return nil, fmt.Errorf("lock run store: %w", err)
-		}
-		if info, statErr := os.Stat(path); statErr == nil && time.Since(info.ModTime()) > lockStale {
-			os.Remove(path)
-			continue
-		}
-		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("lock run store: %s held for over %s", path, lockWait)
-		}
-		time.Sleep(lockPoll)
-	}
-}
-
-const (
-	lockWait  = 5 * time.Second
-	lockPoll  = 20 * time.Millisecond
-	lockStale = 60 * time.Second
-)
-
 // prune caps per-feature history, dropping the oldest terminal runs first and
 // never dropping an active one.
 func prune(doc *document) {
@@ -448,7 +442,7 @@ func prune(doc *document) {
 			if excess == 0 {
 				break
 			}
-			if run.Active() {
+			if run.Active() || (run.Worktree != nil && !run.Worktree.Removed) {
 				continue
 			}
 			drop[run.ID] = true
