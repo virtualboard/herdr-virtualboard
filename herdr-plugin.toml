@@ -22,7 +22,7 @@
 # additionally requires exactly 0.9.0 and socket protocol 22.
 id = "herdr-virtualboard"
 name = "VirtualBoard"
-version = "0.1.0"
+version = "0.2.0"
 description = "Kanban board for VirtualBoard feature specs: columns are the lifecycle, cards are specs, and dispatching a card starts a role agent in a Herdr pane."
 min_herdr_version = "0.9.0"
 platforms = ["linux", "macos"]

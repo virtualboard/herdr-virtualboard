@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -151,22 +152,21 @@ func TestConcurrentUpdatesDoNotLoseWrites(t *testing.T) {
 	}
 }
 
-// Runs are a convenience; the repository is the truth. A corrupt run file must
-// not make the board unusable.
-func TestCorruptFileStartsClean(t *testing.T) {
+// Corrupt data must survive reads and failed writes until explicitly recovered.
+func TestCorruptFileRequiresExplicitRecovery(t *testing.T) {
 	store := newStore(t)
-	if err := store.Append(newRun("r1", "FTR-0001", Running)); err != nil {
-		t.Fatal(err)
-	}
 	if err := writeFile(store.Path(), "{not json at all"); err != nil {
 		t.Fatal(err)
 	}
-	all, err := store.List()
-	if err != nil {
-		t.Fatalf("List over a corrupt file = %v, want a clean start", err)
+	if _, err := store.List(); err == nil {
+		t.Fatal("corrupt run store was silently discarded")
 	}
-	if len(all) != 0 {
-		t.Fatalf("got %d runs from a corrupt file", len(all))
+	if err := store.Append(newRun("r1", "FTR-0001", Running)); err == nil {
+		t.Fatal("write replaced corrupt data")
+	}
+	raw, err := os.ReadFile(store.Path())
+	if err != nil || string(raw) != "{not json at all" {
+		t.Fatalf("original store lost: %q, %v", raw, err)
 	}
 }
 
@@ -255,5 +255,31 @@ func states(list []*Run) []State {
 }
 
 func writeFile(path, content string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
 	return os.WriteFile(path, []byte(content), 0o600)
+}
+
+func TestOpenAndListAbsentStoreDoNotWrite(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "absent-data")
+	t.Setenv("HVB_DATA_DIR", dir)
+	store, err := Open("read-only")
+	if err != nil {
+		t.Fatal(err)
+	}
+	list, err := store.List()
+	if err != nil || len(list) != 0 {
+		t.Fatalf("List: %v, %v", list, err)
+	}
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("read created data directory: %v", err)
+	}
+	if err := store.Append(newRun("r1", "FTR-0001", Running)); err != nil {
+		t.Fatal(err)
+	}
+	list, err = store.List()
+	if err != nil || len(list) != 1 {
+		t.Fatalf("first mutation: %v, %v", list, err)
+	}
 }

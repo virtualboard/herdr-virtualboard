@@ -18,7 +18,7 @@
     <span class="mark" aria-hidden="true"></span>
     <span class="name">herdr-<span class="accent">virtualboard</span></span>
   </a>
-  <span class="ver">v0.1.0</span>
+  <span class="ver">v0.2.0</span>
   <nav id="sectionnav">
     <a href="#why">Why</a>
     <a href="#install">Install</a>
@@ -49,7 +49,7 @@
   <div class="badges">
     <span class="badge blue">herdr &middot; 0.9.0</span>
     <span class="badge green">gates &middot; passing</span>
-    <span class="badge amber">release &middot; v0.1.0</span>
+    <span class="badge amber">release &middot; v0.2.0</span>
     <span class="badge">go 1.25</span>
     <span class="badge">linux &middot; macos</span>
     <span class="badge">mit</span>
@@ -148,7 +148,8 @@ description = <span class="s">"open the VirtualBoard kanban (overlay)"</span></c
     <tr><td><code>H</code> <code>L</code></td><td>shift one column</td><td><code>e</code></td><td>set priority</td></tr>
     <tr><td><code>d</code></td><td><strong>dispatch an agent</strong></td><td><code>o</code></td><td>focus the running agent's pane</td></tr>
     <tr><td><code>x</code></td><td>cancel the active run</td><td><code>r</code></td><td>refresh</td></tr>
-    <tr><td><code>?</code></td><td>help</td><td></td><td></td></tr>
+    <tr><td><code>/ f</code></td><td>search, owner and label filters</td><td><code>c</code></td><td>clear filters</td></tr>
+    <tr><td><code>D</code></td><td>collapse/expand completed cards</td><td><code>?</code></td><td>scrollable help</td></tr>
   </tbody>
 </table>
 </div>
@@ -366,7 +367,7 @@ token   = <span class="s">""</span>                       <span class="c"># Forg
 
 <h2 id="troubleshooting">Troubleshooting</h2>
 
-<p>Start here, always:</p>
+<p>Start with read-only diagnostics. The report checks Herdr compatibility, role charters, run-store contents, and workspace checks from <code>vb doctor</code>. Blocking checks exit 1 with remedies. Corrupt and newer-format stores are preserved for explicit recovery. Doctor also checks missing panes, lease mismatches, pending completions, retained checkout registrations, and project-scoped untracked resources. Warnings require inspection; no pane, lease, or checkout is removed. Dispatch requires the advertised vb ownership, lease-renewal, raw-validation, and validation-exit-status interfaces, and validates its target before replacement and again under its lease. The <code>--force</code> option does not bypass these checks.</p>
 
 <pre><code><span class="k">hvb</span> doctor</code></pre>
 
@@ -376,7 +377,7 @@ token   = <span class="s">""</span>                       <span class="c"># Forg
   <tbody>
     <tr><td>“No VirtualBoard workspace here”</td><td>The board opens on your <em>focused pane's</em> directory. Focus a pane inside a VirtualBoard project, or run <code>vb init</code>.</td></tr>
     <tr><td>The agent sits at a dialog</td><td>Its startup trust prompt. Answer it; hvb submits the task by itself.</td></tr>
-    <tr><td>A run shows <code>awaiting</code></td><td>The agent stopped without reporting — a closed pane, or a finished turn with no <code>hvb run done</code>. The feature is deliberately not moved.</td></tr>
+    <tr><td>A run shows <code>awaiting</code></td><td>The agent stopped without reporting — a closed pane, or a finished turn with no <code>hvb run done</code>. The feature is deliberately not moved. Lease cleanup failures are retained and retried on refresh; a later human outcome obtains fresh ownership without forcing another owner.</td></tr>
     <tr><td>No pull request</td><td><code>hvb run show</code> gives the reason and a compare URL. The run still succeeded.</td></tr>
     <tr><td>Exit 6</td><td>Herdr is not running, or is not exactly 0.9.0 / protocol 22.</td></tr>
   </tbody>
@@ -409,7 +410,7 @@ token   = <span class="s">""</span>                       <span class="c"># Forg
     <tr><td><a href="https://github.com/virtualboard/herdr-virtualboard/blob/main/docs/worktrees.md"><code>docs/worktrees.md</code></a></td><td>worktree dispatch, pull requests, and testing both locally</td></tr>
     <tr><td><a href="https://github.com/virtualboard/herdr-virtualboard/blob/main/docs/herdr.md"><code>docs/herdr.md</code></a></td><td>the verified Herdr contract, and how to re-verify it</td></tr>
     <tr><td><a href="https://github.com/virtualboard/herdr-virtualboard/blob/main/docs/configuration.md"><code>docs/configuration.md</code></a></td><td>every configuration key and environment variable</td></tr>
-    <tr><td><a href="https://github.com/virtualboard/herdr-virtualboard/blob/main/docs/testing.md"><code>docs/testing.md</code></a></td><td>the gates and the end-to-end catalogue</td></tr>
+    <tr><td><a href="https://github.com/virtualboard/herdr-virtualboard/blob/main/docs/testing.md"><code>docs/testing.md</code></a></td><td>the gates, shared workflow fixtures, 50-transition real CLI matrix, and end-to-end catalogue</td></tr>
     <tr><td><a href="https://github.com/virtualboard/herdr-virtualboard/blob/main/AGENTS.md"><code>AGENTS.md</code></a></td><td>the rules for agents working on this repository</td></tr>
   </tbody>
 </table>

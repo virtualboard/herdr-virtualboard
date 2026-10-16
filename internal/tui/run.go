@@ -21,7 +21,7 @@ type Options struct {
 	Colour bool
 	// PaneTitle, when set, is reported to Herdr so the plugin pane's border
 	// names the project rather than the binary.
-	PaneTitle func(title string)
+	PaneTitle func(context.Context, string)
 }
 
 // DefaultRefresh is the background reload interval. It is slow enough not to
@@ -31,6 +31,8 @@ const DefaultRefresh = 5 * time.Second
 
 // Run draws the board until the user quits.
 func Run(ctx context.Context, backend Backend, opts Options) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	if opts.Refresh <= 0 {
 		opts.Refresh = DefaultRefresh
 	}
@@ -46,10 +48,13 @@ func Run(ctx context.Context, backend Backend, opts Options) error {
 	model := NewModel(backend, NewPalette(opts.Colour && term.IsTerminal(int(os.Stdout.Fd()))))
 	width, height := screen.Size()
 	model.Resize(width, height)
-	model.Reload(ctx)
-
 	if opts.PaneTitle != nil {
-		opts.PaneTitle(fmt.Sprintf("VirtualBoard · %s", backend.ProjectName()))
+		title := fmt.Sprintf("VirtualBoard · %s", backend.ProjectName())
+		go func() {
+			titleCtx, stop := context.WithTimeout(ctx, 2*time.Second)
+			defer stop()
+			opts.PaneTitle(titleCtx, title)
+		}()
 	}
 
 	keys := ReadKeys(screen.Input())
@@ -60,15 +65,42 @@ func Run(ctx context.Context, backend Backend, opts Options) error {
 	ticker := time.NewTicker(opts.Refresh)
 	defer ticker.Stop()
 
+	return runLoop(ctx, model, screen, keys, resized, ticker.C)
+}
+
+// boardScreen keeps the actual event loop testable with channels and a frame
+// sink. Tests never enter raw mode or talk to a real Herdr session.
+type boardScreen interface {
+	Size() (int, int)
+	Invalidate()
+	Draw([]string) error
+}
+
+func runLoop(ctx context.Context, model *Model, screen boardScreen, keys <-chan Key, resized <-chan os.Signal, ticks <-chan time.Time) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	worker := newTaskWorker(ctx, model.backend)
+	defer func() {
+		cancel()
+		// Context-aware subprocesses get a short grace period to record or
+		// stop a partially launched run before the CLI process exits.
+		timer := time.NewTimer(2 * time.Second)
+		defer timer.Stop()
+		select {
+		case <-worker.done:
+		case <-timer.C:
+		}
+	}()
+	model.enqueue = worker.submit
+	defer func() { model.enqueue = nil }()
+	model.Reload(ctx)
 	if err := screen.Draw(model.Render()); err != nil {
 		return err
 	}
-
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-
 		case key, ok := <-keys:
 			if !ok {
 				return nil
@@ -82,7 +114,11 @@ func Run(ctx context.Context, backend Backend, opts Options) error {
 			if err := screen.Draw(model.Render()); err != nil {
 				return err
 			}
-
+		case result := <-worker.results:
+			model.accept(result)
+			if err := screen.Draw(model.Render()); err != nil {
+				return err
+			}
 		case <-resized:
 			width, height := screen.Size()
 			model.Resize(width, height)
@@ -90,13 +126,9 @@ func Run(ctx context.Context, backend Backend, opts Options) error {
 			if err := screen.Draw(model.Render()); err != nil {
 				return err
 			}
-
-		case <-ticker.C:
-			// A background reload must never disturb an overlay: reloading
-			// under an open form would discard what the user is typing.
-			if model.view != ViewBoard && model.view != ViewDetail {
-				continue
-			}
+		case <-ticks:
+			// Snapshots only replace card data. Open forms and picker callbacks stay
+			// intact, so refreshing can continue while the user is entering text.
 			model.Reload(ctx)
 			if err := screen.Draw(model.Render()); err != nil {
 				return err

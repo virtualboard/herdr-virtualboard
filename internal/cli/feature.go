@@ -272,6 +272,9 @@ than an exit code.`,
 			if err := app.VB().Index(ctx); err != nil {
 				app.Warn("hvb: index regeneration failed: %v", err)
 			}
+			if _, err := app.Dispatcher().AutoStart(ctx, spec.ID); err != nil {
+				return fmt.Errorf("moved %s to %s, but automatic dispatch failed: %w", spec.ID, target, err)
+			}
 			if app.Emit(moved) {
 				return nil
 			}

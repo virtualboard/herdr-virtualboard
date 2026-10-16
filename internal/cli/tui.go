@@ -69,7 +69,7 @@ board can never disagree; pressing d dispatches a role agent into a Herdr pane.`
 			return tui.Run(ctx, backend, tui.Options{
 				Refresh:   refresh,
 				Colour:    colour,
-				PaneTitle: app.paneTitle(ctx),
+				PaneTitle: app.paneTitle(),
 			})
 		},
 	}
@@ -93,12 +93,12 @@ func (a *App) showNotice(ctx context.Context, notice tui.Notice, colour bool, ca
 
 // paneTitle returns a callback that relabels the plugin's own Herdr pane, or
 // nil when hvb is not running inside one.
-func (a *App) paneTitle(ctx context.Context) func(string) {
+func (a *App) paneTitle() func(context.Context, string) {
 	paneID := os.Getenv("HERDR_PANE_ID")
 	if paneID == "" {
 		return nil
 	}
-	return func(title string) {
+	return func(ctx context.Context, title string) {
 		// Cosmetic: a failed rename leaves the default border and is not
 		// worth interrupting the board for.
 		_ = a.Herdr().RenamePane(ctx, paneID, title)

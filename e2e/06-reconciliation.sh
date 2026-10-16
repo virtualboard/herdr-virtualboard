@@ -27,10 +27,9 @@ assert_contains "$out" "FTR-0001" "the feature is still in progress"
 
 # A harness that reports done without calling `hvb run done` parks the same way.
 add_spec "$ROOT" in-progress FTR-0002 "Silent finisher"
-run_id="$(hvb --json run start FTR-0002 | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
-cat > "$STUBS/agents.json" <<'JSON'
-{"id":"x","result":{"agents":[{"pane_id":"w1:p3","agent":"claude","agent_status":"done"}]}}
-JSON
+started="$(hvb --json run start FTR-0002)"
+run_id="$(printf '%s' "$started" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
+printf '%s' "$started" | python3 -c 'import json,sys; run=json.load(sys.stdin); json.dump({"id":"x","result":{"agents":[{"pane_id":run["pane_id"],"agent":"claude","agent_status":"done"}]}},sys.stdout)' > "$STUBS/agents.json"
 
 out="$(hvb --json run show "$run_id")"
 assert_contains "$out" '"outcome": "agent_done"' "a finished-but-silent harness parks as agent_done"

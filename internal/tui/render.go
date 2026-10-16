@@ -20,7 +20,7 @@ func (m *Model) Render() []string {
 		return m.frame(m.renderHelp())
 	case ViewDetail:
 		return m.frame(m.renderDetail())
-	case ViewNewFeature, ViewMovePicker, ViewDispatchPicker, ViewConfirm:
+	case ViewNewFeature, ViewFilters, ViewMovePicker, ViewDispatchPicker, ViewConfirm:
 		// Overlays draw on top of the board so the user keeps their place.
 		return m.frame(m.overlay(m.renderBoard()))
 	default:
@@ -64,7 +64,11 @@ func (m *Model) renderHeader() string {
 	if active := m.ActiveRunCount(); active > 0 {
 		right = paint(m.palette.Running, fmt.Sprintf("▶%d ", active)) + right
 	}
-	right += fmt.Sprintf("  %d", total)
+	if m.filters.active() {
+		right += fmt.Sprintf("  %d/%d", total, m.totalCards())
+	} else {
+		right += fmt.Sprintf("  %d", total)
+	}
 
 	gap := m.width - displayWidth(left) - displayWidth(right) - 1
 	if gap < 1 {
@@ -85,11 +89,17 @@ func (m *Model) renderFooter() string {
 }
 
 func (m *Model) footerMessage() (string, bool, bool) {
+	if message := m.pendingMessage(); message != "" {
+		return message, false, true
+	}
 	if message, isError := m.statusMessage(); message != "" {
 		return message, isError, true
 	}
 	if len(m.problems) > 0 {
 		return fmt.Sprintf("%d spec(s) could not be read — press ? for detail", len(m.problems)), true, true
+	}
+	if m.filters.active() {
+		return m.filterMessage(), false, true
 	}
 	return "", false, false
 }
@@ -97,14 +107,23 @@ func (m *Model) footerMessage() (string, bool, bool) {
 func (m *Model) keyHint() string {
 	switch m.view {
 	case ViewDetail:
+		if m.width < 50 {
+			return "esc back · ? help"
+		}
 		return "esc back · e edit · d dispatch · m move · o focus pane · x cancel run · ? help"
 	case ViewHelp:
-		return "esc back"
-	default:
-		if m.compact() {
-			return "↑↓ card · ←→ column · ⏎ detail · d dispatch · ? help · q quit"
+		if m.width < 50 {
+			return "↑↓ scroll · esc back"
 		}
-		return "←→/hl column · ↑↓/jk card · ⏎ detail · n new · m move · H/L shift · d dispatch · r refresh · ? help · q quit"
+		return "↑↓/pgup/pgdn scroll · esc back"
+	default:
+		if m.width < 50 {
+			return "/ search · ? help · q quit"
+		}
+		if m.compact() {
+			return "←→ cols · ↑↓ cards · / search · ? help · q quit"
+		}
+		return "←→ cols · ↑↓ cards · ⏎ detail · / search · f filters · D done · n new · m move · d dispatch · ? help · q quit"
 	}
 }
 
@@ -186,7 +205,10 @@ func (m *Model) renderColumn(status feature.Status, width, height int, focused b
 	}
 
 	body := make([]string, 0, height)
-	title := fmt.Sprintf("%s %d", strings.ToUpper(status.Title()), len(cards))
+	title := fmt.Sprintf("%s %d", strings.ToUpper(status.Title()), m.matchedCounts[status])
+	if status == feature.Done && m.hideDone {
+		title += " ▸"
+	}
 	titleColour := m.palette.Status(status)
 	if focused {
 		titleColour += m.palette.Bold
@@ -198,7 +220,10 @@ func (m *Model) renderColumn(status feature.Status, width, height int, focused b
 		body = append(body, paint(m.palette.Dim, fit(" auto → "+column.OnSuccess, inner)))
 	}
 
-	if visible := height - len(body); visible > 0 {
+	if status == feature.Done && m.hideDone {
+		body = append(body, paint(m.palette.Dim, fit(" D to expand completed", inner)))
+	}
+	if visible := height - len(body); visible > 0 && !(status == feature.Done && m.hideDone) {
 		selected := m.card[status]
 		start := scrollWindow(selected, len(cards), visible/cardHeight)
 		for index := start; index < len(cards); index++ {

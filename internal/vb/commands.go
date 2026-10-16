@@ -97,6 +97,7 @@ type Lock struct {
 	ExpiresAt  string `json:"expires_at"`
 	TTLMinutes int    `json:"ttl_minutes"`
 	Expired    bool   `json:"expired"`
+	Token      string `json:"token,omitempty"`
 }
 
 // Acquire takes the feature lock for an owner. force overrides a live lock held
@@ -112,28 +113,50 @@ func (c *Client) Acquire(ctx context.Context, id, owner string, ttlMinutes int, 
 	return c.lockCall(ctx, args)
 }
 
+func (c *Client) Renew(ctx context.Context, id, token string) (*Lock, error) {
+	return c.lockCall(ctx, []string{"lock", id, "--renew", "--token", token})
+}
+
 // Release drops the feature lock.
-func (c *Client) Release(ctx context.Context, id string) error {
-	_, err := c.run(ctx, "lock", id, "--release")
+func (c *Client) Release(ctx context.Context, id string, token ...string) error {
+	args := []string{"lock", id, "--release"}
+	if len(token) > 0 && token[0] != "" {
+		args = append(args, "--token", token[0])
+	}
+	_, err := c.run(ctx, args...)
 	return err
 }
 
 // LockStatus reports the current lock, or nil when the feature is unlocked.
 func (c *Client) LockStatus(ctx context.Context, id string) (*Lock, error) {
-	lock, err := c.lockCall(ctx, []string{"lock", id, "--status"})
+	envelope, err := c.run(ctx, "lock", id, "--status")
 	if err != nil {
 		var vbErr *Error
-		// An unlocked feature is a normal state, not a failure the caller
-		// should have to distinguish by message.
 		if errorsAs(err, &vbErr) && vbErr.Code == ExitNotFound {
 			return nil, nil
 		}
 		return nil, err
 	}
-	if lock != nil && lock.Owner == "" {
+	var status struct {
+		Lock
+		Locked *bool `json:"locked"`
+	}
+	if err := json.Unmarshal(envelope.Data, &status); err != nil {
+		return nil, fmt.Errorf("decode vb lock status: %w", err)
+	}
+	if status.ID != id {
+		return nil, fmt.Errorf("vb lock status did not confirm feature %s", id)
+	}
+	if status.Owner == "" {
+		if status.Locked == nil || *status.Locked || status.Token != "" {
+			return nil, fmt.Errorf("vb lock status did not explicitly confirm an unlocked feature")
+		}
 		return nil, nil
 	}
-	return lock, nil
+	if status.Locked != nil && !*status.Locked {
+		return nil, fmt.Errorf("vb lock status contradicts its owner metadata")
+	}
+	return &status.Lock, nil
 }
 
 func (c *Client) lockCall(ctx context.Context, args []string) (*Lock, error) {
@@ -192,16 +215,130 @@ func (c *Client) Validate(ctx context.Context, target string, fix bool) (*Valida
 		// transport failure, and the caller wants the details either way.
 		var vbErr *Error
 		if errorsAs(err, &vbErr) && (vbErr.Code == ExitValidation || vbErr.Code == ExitSchema) {
+			if len(vbErr.Data) > 0 {
+				result, decodeErr := decodeValidation(target, vbErr.Data)
+				if decodeErr == nil && result.OK() {
+					return nil, fmt.Errorf("vb validation failure contradicts its successful report")
+				}
+				return result, decodeErr
+			}
 			return &ValidationResult{Target: target, Message: vbErr.Message,
 				Features: ValidationGroup{Invalid: 1}}, nil
 		}
 		return nil, err
 	}
+	return decodeValidation(target, envelope.Data)
+}
+
+func decodeValidation(target string, data json.RawMessage) (*ValidationResult, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil || fields == nil {
+		return nil, fmt.Errorf("incomplete vb validation response")
+	}
 	var result ValidationResult
-	if err := json.Unmarshal(envelope.Data, &result); err != nil {
+	if err := json.Unmarshal(data, &result); err != nil {
 		return nil, fmt.Errorf("decode vb validate result: %w", err)
 	}
+	// vb's individual-feature response predates the combined group shape.
+	// Normalize both so callers never mistake missing group counts for success.
+	var single struct {
+		ID     string   `json:"id"`
+		Name   string   `json:"name"`
+		Status string   `json:"status"`
+		Errors []string `json:"errors"`
+	}
+	if err := json.Unmarshal(data, &single); err != nil {
+		return nil, err
+	}
+	if single.ID != "" || single.Name != "" {
+		if _, found := fields["errors"]; !found {
+			return nil, fmt.Errorf("vb validation response omitted errors")
+		}
+		if single.ID != "" && single.Name != "" {
+			return nil, fmt.Errorf("ambiguous vb validation response")
+		}
+		if len(single.Errors) == 0 && single.Status == "" {
+			return nil, fmt.Errorf("vb validation response omitted status")
+		}
+		group := ValidationGroup{Total: 1, Results: map[string]ValidationEntry{}}
+		if len(single.Errors) > 0 {
+			group.Invalid = 1
+		} else {
+			group.Valid = 1
+		}
+		id := single.ID
+		if id == "" {
+			id = single.Name
+		}
+		group.Results[id] = ValidationEntry{Status: single.Status, Errors: single.Errors}
+		if single.ID != "" {
+			result.Features = group
+		} else {
+			result.Specs = group
+		}
+	}
+	if single.ID == "" && single.Name == "" {
+		found := false
+		for _, name := range []string{"features", "specs"} {
+			raw, present := fields[name]
+			if !present {
+				continue
+			}
+			found = true
+			if err := validateGroupReport(raw); err != nil {
+				return nil, fmt.Errorf("decode vb validate %s: %w", name, err)
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("vb validation response omitted results")
+		}
+	}
+	result.Target = target
 	return &result, nil
+}
+
+func validateGroupReport(raw json.RawMessage) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil || fields == nil {
+		return fmt.Errorf("missing summary")
+	}
+	var group ValidationGroup
+	if err := json.Unmarshal(raw, &group); err != nil {
+		return err
+	}
+	for _, name := range []string{"total", "valid", "invalid", "results"} {
+		value, ok := fields[name]
+		if !ok || string(value) == "null" {
+			return fmt.Errorf("missing %s", name)
+		}
+	}
+	if group.Total < 0 || group.Valid < 0 || group.Invalid < 0 || group.Valid > group.Total || group.Invalid != group.Total-group.Valid || group.Results == nil || len(group.Results) < group.Valid || len(group.Results) > group.Total {
+		return fmt.Errorf("inconsistent summary counts")
+	}
+	var entries map[string]map[string]json.RawMessage
+	if err := json.Unmarshal(fields["results"], &entries); err != nil {
+		return err
+	}
+	invalid := 0
+	for id, entry := range group.Results {
+		if id == "" {
+			return fmt.Errorf("empty result identifier")
+		}
+		if _, ok := entries[id]["errors"]; !ok {
+			return fmt.Errorf("result %s omitted errors", id)
+		}
+		if len(entry.Errors) > 0 {
+			invalid++
+		} else if entry.Status == "" {
+			return fmt.Errorf("result %s omitted status", id)
+		}
+	}
+	// Duplicate identifiers can collapse invalid entries in older vb reports.
+	// Preserve those diagnostics, but never accept an error as a successful count.
+	if invalid > group.Invalid || len(group.Results)-invalid != group.Valid {
+		return fmt.Errorf("results contradict summary")
+	}
+	return nil
 }
 
 // Index regenerates `features/INDEX.md`.

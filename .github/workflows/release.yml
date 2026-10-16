@@ -1,0 +1,168 @@
+name: Build, Test, and Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hvb-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GO_VERSION: "1.25"
+
+jobs:
+  test:
+    name: Run release gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Verify release tag matches VERSION
+        run: |
+          VERSION="v$(tr -d '\r\n' < VERSION)"
+          if [[ "$VERSION" != "$GITHUB_REF_NAME" ]]; then
+            echo "Tag $GITHUB_REF_NAME does not match VERSION ($VERSION)" >&2
+            exit 1
+          fi
+      - name: Run full gates
+        run: make gates
+
+  integration:
+    name: Test pinned vb and template releases
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - id: releases
+        name: Read exact compatible release refs
+        run: |
+          source .github/release-versions
+          echo "vb=$VB_REF" >> "$GITHUB_OUTPUT"
+          echo "template=$TEMPLATE_REF" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: virtualboard/vb-cli
+          ref: ${{ steps.releases.outputs.vb }}
+          path: vb-cli-release
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: virtualboard/template-base
+          ref: ${{ steps.releases.outputs.template }}
+          path: template-base-release
+      - name: Verify cross-repository version pins
+        env:
+          VB_REF: ${{ steps.releases.outputs.vb }}
+          TEMPLATE_REF: ${{ steps.releases.outputs.template }}
+        run: |
+          VB_TEMPLATE_REF=$(sed -n 's/^const TemplateCurrent = "\(.*\)"$/\1/p' vb-cli-release/internal/version/version.go)
+          TEMPLATE_VB_REF=$(tr -d '\r\n' < template-base-release/.vb-version)
+          if [[ "$VB_TEMPLATE_REF" != "$TEMPLATE_REF" || "$TEMPLATE_VB_REF" != "$VB_REF" ]]; then
+            echo "Incompatible release pins: vb expects $VB_TEMPLATE_REF, template expects $TEMPLATE_VB_REF." >&2
+            exit 1
+          fi
+      - name: Build pinned vb CLI
+        run: |
+          mkdir -p bin
+          (cd vb-cli-release && go build -o "$GITHUB_WORKSPACE/bin/vb" .)
+      - name: Run real-binary integration
+        run: make integration VB_REAL_BIN="$GITHUB_WORKSPACE/bin/vb" TEMPLATE_SOURCE="$GITHUB_WORKSPACE/template-base-release"
+
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: [test, integration]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            platform: linux-amd64
+          - goos: linux
+            goarch: arm64
+            platform: linux-arm64
+          - goos: darwin
+            goarch: amd64
+            platform: macos-amd64
+          - goos: darwin
+            goarch: arm64
+            platform: macos-arm64
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build hvb
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          mkdir -p dist
+          go build -ldflags="-s -w -X main.version=${{ github.ref_name }}" -o "dist/hvb-${{ matrix.platform }}" ./cmd/hvb
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: hvb-${{ matrix.platform }}
+          path: dist/hvb-${{ matrix.platform }}
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    concurrency:
+      group: hvb-release-publish
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - name: Prepare release assets
+        run: |
+          mkdir -p release-assets
+          for artifact in hvb-*; do
+            if [[ -d "$artifact" ]]; then cp "$artifact"/* release-assets/; fi
+          done
+          cd release-assets
+          test -n "$(find . -maxdepth 1 -type f -name 'hvb-*' -print -quit)"
+          sha256sum hvb-* > checksums.txt
+          cd ..
+          awk '/^## \[Unreleased\]/{active=1; next} /^## \[/{if(active) exit} active{print}' CHANGELOG.md > release-notes.md
+          test -s release-notes.md
+      - name: Refuse to overwrite an existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          STATUS=$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME")
+          case "$STATUS" in
+            404) ;;
+            200) echo "Release $GITHUB_REF_NAME already exists; releases are immutable." >&2; exit 1 ;;
+            *) echo "Unable to verify whether release $GITHUB_REF_NAME exists (HTTP $STATUS)." >&2; exit 1 ;;
+          esac
+      - name: Create Release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Herdr VirtualBoard ${{ github.ref_name }}
+          body_path: release-notes.md
+          files: release-assets/*
+          draft: false
+          prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}

@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -191,6 +192,14 @@ func (r *Repo) CurrentBranch(ctx context.Context) (string, error) {
 	return strings.TrimSpace(out), nil
 }
 
+func (r *Repo) Head(ctx context.Context) (string, error) {
+	out, err := r.run(ctx, DefaultTimeout, "rev-parse", "--verify", "HEAD")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
 // At returns a Repo rooted at another directory — a worktree checkout — keeping
 // the same git binary.
 func (r *Repo) At(dir string) *Repo { return &Repo{Root: dir, Bin: r.Bin} }
@@ -198,6 +207,9 @@ func (r *Repo) At(dir string) *Repo { return &Repo{Root: dir, Bin: r.Bin} }
 func (r *Repo) bin() string {
 	if r.Bin != "" {
 		return r.Bin
+	}
+	if bin := os.Getenv("HVB_GIT_BIN"); bin != "" {
+		return bin
 	}
 	return Binary
 }

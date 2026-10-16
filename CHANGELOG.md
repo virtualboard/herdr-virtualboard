@@ -8,6 +8,13 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **`hvb doctor`** checks CLI compatibility, board metadata, leases, run records,
+  audit integrity, and orphaned Herdr resources; it reports repair steps without
+  mutating project files.
+- **TUI search and filters** cover owner, label, status, and free text, with a
+  collapsed completed-work section and asynchronous terminal-safe refreshes.
+- **Bounded transition automation** can start the next workflow role after a
+  feature transition, with duplicate, concurrency, and stage limits.
 - **Optional worktree dispatch.** Moving a card into `in-progress` now asks
   whether to start an agent, and how isolated it should be: in the project, in a
   git worktree on the feature's own branch, or in a worktree with a pull request
@@ -33,6 +40,16 @@ All notable changes to this project are documented here. The format follows
   can be built.
 - Nothing here is on by default. No branch is cut and no forge is contacted
   unless a dispatch asks for it.
+
+### Changed
+
+- Run documents use a versioned format with quarantine-based corruption
+  recovery. Unsupported future formats fail closed and retain cleanup records.
+- Completion side effects are retryable and serialized. Cancellation and
+  timeout stop the recorded pane before lease release; nonce ownership prevents
+  an old run from releasing a successor's lease.
+- Review runs inherit the implementation worktree revision, and cleanup
+  protects active reviewer checkouts.
 
 ## [0.1.0] — 2026-09-15
 

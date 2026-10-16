@@ -26,6 +26,7 @@ type Frontmatter struct {
 	Dependencies []string `yaml:"dependencies,omitempty" json:"dependencies,omitempty"`
 	Epic         string   `yaml:"epic,omitempty" json:"epic,omitempty"`
 	RiskNotes    string   `yaml:"risk_notes,omitempty" json:"risk_notes,omitempty"`
+	Role         string   `yaml:"role,omitempty" json:"role,omitempty"`
 }
 
 // Spec is one feature spec file: its frontmatter, its markdown body, and where

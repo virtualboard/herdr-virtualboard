@@ -122,26 +122,27 @@ const maxCommitsInBody = 20
 // recordPullRequestLink writes the pull request into the feature spec, through
 // vb, so the link survives in the repository rather than only in hvb's local
 // run store.
-func (d *Dispatcher) recordPullRequestLink(ctx context.Context, run *runs.Run, pr *runs.PullRequest) {
+func (d *Dispatcher) recordPullRequestLink(ctx context.Context, run *runs.Run, pr *runs.PullRequest) error {
 	if pr == nil || !pr.Opened || pr.URL == "" {
-		return
+		return nil
 	}
 	spec, err := d.Workspace.FindSpec(run.FeatureID)
 	if err != nil {
-		return
+		return err
 	}
 	existing, _ := spec.Section("Links")
 	if strings.Contains(existing, pr.URL) {
-		return
+		return nil
 	}
 	entry := fmt.Sprintf("- Pull request: %s", pr.URL)
 	updated := entry
 	if trimmed := strings.TrimSpace(existing); trimmed != "" {
 		updated = trimmed + "\n" + entry
 	}
-	if err := d.VB.Update(ctx, run.FeatureID, nil, map[string]string{"Links": updated}); err != nil {
-		d.note(run.ID, fmt.Sprintf("could not write the pull-request link into the spec: %v", err))
+	if err := d.vbForRun(run).Update(ctx, run.FeatureID, nil, map[string]string{"Links": updated}); err != nil {
+		return fmt.Errorf("could not write the pull-request link into the spec: %w", err)
 	}
+	return nil
 }
 
 func stripUntrustedMarkers(text string) string {
@@ -157,6 +158,16 @@ func stripUntrustedMarkers(text string) string {
 // nowhere else — the whole point of the worktree is that it is separate from
 // the main checkout.
 func (d *Dispatcher) CleanupWorktree(ctx context.Context, runID string, force bool) (*runs.Run, error) {
+	var run *runs.Run
+	err := d.Store.WithRunTransaction(ctx, "@dispatch", func() error {
+		var err error
+		run, err = d.cleanupWorktree(ctx, runID, force)
+		return err
+	})
+	return run, err
+}
+
+func (d *Dispatcher) cleanupWorktree(ctx context.Context, runID string, force bool) (*runs.Run, error) {
 	run, err := d.Store.Get(runID)
 	if err != nil {
 		return nil, err
@@ -167,13 +178,30 @@ func (d *Dispatcher) CleanupWorktree(ctx context.Context, runID string, force bo
 	if run.Worktree.Removed {
 		return run, nil
 	}
+	allRuns, err := d.Store.List()
+	if err != nil {
+		return nil, err
+	}
+	for _, other := range allRuns {
+		if other.ID != run.ID && other.Active() && other.Worktree != nil && other.Worktree.Path == run.Worktree.Path {
+			return nil, fmt.Errorf("checkout is still used by active run %s; cancel that run before cleanup", other.ID)
+		}
+	}
 	if run.Active() && !force {
 		return nil, fmt.Errorf("run %s is still %s — cancel it first, or pass --force", runID, run.State)
+	}
+	if run.Active() {
+		if _, err := d.Cancel(ctx, runID, "cancelled for forced worktree cleanup"); err != nil {
+			return nil, err
+		}
 	}
 	if !force {
 		repo := d.repoFor(run)
 		clean, err := repo.Clean(ctx)
-		if err == nil && !clean {
+		if err != nil {
+			return nil, fmt.Errorf("inspect worktree before cleanup: %w", err)
+		}
+		if !clean {
 			return nil, fmt.Errorf("the worktree at %s has uncommitted changes; pass --force to discard them",
 				run.Worktree.Path)
 		}
@@ -181,10 +209,17 @@ func (d *Dispatcher) CleanupWorktree(ctx context.Context, runID string, force bo
 	if err := d.Herdr.RemoveWorktree(ctx, run.Worktree.WorkspaceID, force); err != nil {
 		return nil, fmt.Errorf("remove the worktree: %w", err)
 	}
-	return d.Store.Update(runID, func(r *runs.Run) error {
-		if r.Worktree != nil {
-			r.Worktree.Removed = true
+	// Implementation and review can share a checkout. Mark every reference
+	// after removal so history does not offer cleanup for an absent resource.
+	for _, other := range allRuns {
+		if other.Worktree != nil && other.Worktree.Path == run.Worktree.Path {
+			if _, err := d.Store.Update(other.ID, func(r *runs.Run) error {
+				r.Worktree.Removed = true
+				return nil
+			}); err != nil {
+				return nil, err
+			}
 		}
-		return nil
-	})
+	}
+	return d.Store.Get(runID)
 }

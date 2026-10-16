@@ -24,7 +24,7 @@ git init -q --bare "$BARE"
 git -C "$ROOT" remote add origin "$BARE"
 git -C "$ROOT" push -q --set-upstream origin main
 
-out="$(hvb --json run start FTR-0001 --worktree --pr 2>&1)"
+out="$(hvb --json run start FTR-0001 --pr 2>&1)"
 assert_contains "$out" '"branch": "feature/FTR-0001/add-retry"' "the branch follows the VirtualBoard convention"
 assert_contains "$out" '"base": "main"' "it was cut from the default branch"
 assert_contains "$out" '"pull_request"' "the run records that a PR was asked for"
@@ -61,6 +61,16 @@ assert_contains "$out" '"opened": false' "a local remote has no forge to open a 
 assert_contains "$out" "no pull-request client" "and it says so"
 out_state="$(hvb --json run show "$run_id")"
 assert_contains "$out_state" '"state": "succeeded"' "the run still succeeded"
+
+# A review must see the implementation branch, even when worktrees are off
+# globally. The main checkout deliberately lacks retry.go.
+review="$(hvb --json run start FTR-0001 2>&1)"
+assert_contains "$review" '"review_of"' "review records its immutable implementation handoff"
+assert_contains "$review" "\"path\": \"$wt\"" "review inherits the implementation checkout"
+assert_equals "$([ -f "$ROOT/retry.go" ] && echo yes || echo no)" "no" "main checkout does not contain the implementation"
+review_id="$(printf '%s' "$review" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
+assert_exit 1 "cleanup protects a checkout used by an active reviewer" -- hvb run cleanup "$run_id"
+hvb run cancel "$review_id" >/dev/null
 
 # Cleanup refuses to discard work that exists nowhere else.
 echo "scratch" > "$wt/uncommitted.txt"

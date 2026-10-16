@@ -20,7 +20,10 @@ hvb injected these into your environment:
 | `HVB_RUN_ID` | this dispatch |
 | `HVB_ROLE` | the VirtualBoard role charter you adopted |
 | `HVB_STATUS` | the lifecycle status you were dispatched from |
-| `HVB_PROJECT_ROOT` | the repository root; also your working directory |
+| `HVB_PROJECT_ROOT` | the board repository root; worktree runs have a separate working directory |
+| `VIRTUALBOARD_ROOT` | the board repository root used by VirtualBoard tooling |
+| `VB_OWNER` | the identity holding this run’s feature lease |
+| `VB_LOCK_TOKEN` | the lease token; preserve it for feature mutations and never include it in reports |
 | `HVB_ON_SUCCESS` / `HVB_ON_FAILURE` | where the board moves the feature when you report |
 
 If you were dispatched into an isolated git worktree, these are set too:
@@ -58,8 +61,9 @@ Every `hvb` command below infers the run from `HVB_RUN_ID`, so you never pass it
    Commit in logical steps, with messages that say why, and name the feature id.
    Do not switch branches, do not rebase, and do not touch the main checkout.
 8. **Do not push, and do not open a pull request.** hvb does both when you
-   report success, so that the branch, the board and the feature spec stay
-   consistent with each other. Pushing yourself races that.
+   report success **if the dispatch requested a PR**. A worktree alone does
+   not request publication. Keep publishing with hvb so retries and feature
+   links stay consistent.
 
 ## Commands
 
@@ -100,15 +104,25 @@ If you exit without reporting, the run lands in `awaiting` and waits for a
 human. That is not a failure state — it is the board saying "the agent stopped
 and nobody knows why yet". Reporting is always better.
 
-On a worktree run, `success` also publishes your work: hvb pushes `$HVB_BRANCH`
-and opens a pull request against `$HVB_BASE_BRANCH`, with your commits and the
-feature's acceptance criteria in the description. Anything you did not commit is
-not in it. If you have commits but know the work is incomplete, report `failure`
-with a note — the branch is kept either way, and a half-finished branch nobody
-asked to review is better than a pull request that claims to be done.
+A worktree run must be clean on its assigned branch before reporting success.
+hvb records the exact commit for the review handoff. A reviewer checks that
+revision and reports findings; do not change the review checkout's commit.
+Record the commit, commands executed, their results, and how they demonstrate
+the acceptance criteria in a feature note before reporting.
+
+When the dispatch requested `--pr`, success also asks hvb to push and open a
+pull request. `--pr` implies a worktree; `--worktree` alone stays local. A failed
+publishing attempt remains visible with its reason and can be retried.
+
+After reporting, stop work. A nonzero exit can mean that the outcome was saved
+but routing, indexing, or lease release is pending. Inspect `hvb run show`;
+`hvb run retry` resumes the saved outcome without repeating completed phases.
+Do not submit a different outcome to repair a side effect. Explicit cancellation
+stops remaining completion effects, including automatic handoff, and cannot be
+reversed with retry. A human can start a new run when appropriate.
 
 ## Exit codes
 
-`hvb` exits `0` on success, `2` when a feature or run is not found, `3` on an
+`hvb` exits `0` on success, `1` for validation or pending completion, `2` when a feature or run is not found, `3` on an
 illegal lifecycle transition, `5` on a lock conflict, and `64` on a usage error.
 Branch on `$?` rather than parsing messages.

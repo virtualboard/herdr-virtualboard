@@ -20,6 +20,8 @@ func newRunCommand(app *App) *cobra.Command {
 		newRunListCommand(app),
 		newRunShowCommand(app),
 		newRunDoneCommand(app),
+		newRunRetryCommand(app),
+		newRunRecoverCommand(app),
 		newRunCommentCommand(app),
 		newRunCancelCommand(app),
 		newRunFocusCommand(app),
@@ -72,6 +74,12 @@ pushes that branch and opens a pull request when the agent reports success.`,
 			}
 			if pr && noWorktree {
 				return Usage("--pr needs a branch to open from; drop --no-worktree")
+			}
+			if pr {
+				// A PR requires an isolated branch even when worktrees are not
+				// enabled globally; --pr explicitly requests that side effect.
+				value := true
+				wantWorktree = &value
 			}
 
 			run, err := app.Dispatcher().Start(contextFor(cmd), dispatch.Request{
@@ -294,6 +302,9 @@ a blocked outcome moves it to blocked where the lifecycle allows.`,
 				return err
 			}
 			if app.Emit(completion) {
+				if completion.Pending || completion.AutomationError != "" {
+					return errSilent{}
+				}
 				return nil
 			}
 			app.Print("%s reported %s", completion.Run.FeatureID, completion.Run.Outcome)
@@ -315,6 +326,14 @@ a blocked outcome moves it to blocked where the lifecycle allows.`,
 			}
 			if completion.TransitionError != "" {
 				app.Warn("hvb: the feature was not moved: %s", completion.TransitionError)
+			}
+			if completion.Pending {
+				app.Warn("Outcome saved; retry unfinished effects with `hvb run retry %s`", run.ID)
+				return errSilent{}
+			}
+			if completion.AutomationError != "" {
+				app.Warn("Outcome saved; automatic handoff failed: %s", completion.AutomationError)
+				return errSilent{}
 			}
 			return nil
 		},

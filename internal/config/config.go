@@ -29,6 +29,8 @@ const ProjectFile = ".hvb.toml"
 
 // Config is the resolved settings for one project.
 type Config struct {
+	MaxAutoStages     int `toml:"max_auto_stages"`
+	MaxConcurrentRuns int `toml:"max_concurrent_runs"`
 	// Harness is the default Herdr agent kind for dispatches.
 	Harness string `toml:"harness"`
 	// Role is the fallback VirtualBoard role when a feature's labels and
@@ -170,14 +172,16 @@ func (d Duration) Duration() time.Duration { return time.Duration(d) }
 // builds, review checks, and done is terminal.
 func Default() Config {
 	return Config{
-		Harness:        "claude",
-		Role:           "fullstack_dev",
-		LockTTLMinutes: 60,
-		StartTimeout:   Duration(90 * time.Second),
-		PromptTimeout:  Duration(10 * time.Minute),
-		Placement:      "overlay",
-		Worktree:       Worktree{Branch: git.BranchTemplate, Remote: "origin"},
-		Forge:          Forge{Draft: true},
+		MaxAutoStages:     8,
+		MaxConcurrentRuns: 3,
+		Harness:           "claude",
+		Role:              "fullstack_dev",
+		LockTTLMinutes:    60,
+		StartTimeout:      Duration(90 * time.Second),
+		PromptTimeout:     Duration(10 * time.Minute),
+		Placement:         "overlay",
+		Worktree:          Worktree{Branch: git.BranchTemplate, Remote: "origin"},
+		Forge:             Forge{Draft: true},
 		Columns: map[string]Column{
 			string(feature.Backlog): {},
 			string(feature.InProgress): {
@@ -277,6 +281,12 @@ func mergeFile(cfg *Config, path string) error {
 	if meta.IsDefined("lock_ttl_minutes") {
 		cfg.LockTTLMinutes = overlay.LockTTLMinutes
 	}
+	if meta.IsDefined("max_auto_stages") {
+		cfg.MaxAutoStages = overlay.MaxAutoStages
+	}
+	if meta.IsDefined("max_concurrent_runs") {
+		cfg.MaxConcurrentRuns = overlay.MaxConcurrentRuns
+	}
 	if meta.IsDefined("start_timeout") {
 		cfg.StartTimeout = overlay.StartTimeout
 	}
@@ -345,6 +355,9 @@ func mergeFile(cfg *Config, path string) error {
 // status, a routing destination VirtualBoard does not allow, or a forge kind
 // hvb has no client for.
 func (c *Config) Validate() error {
+	if c.MaxAutoStages < 0 || c.MaxConcurrentRuns < 0 {
+		return fmt.Errorf("config: automation and concurrency limits cannot be negative")
+	}
 	switch git.Kind(strings.ToLower(c.Forge.Kind)) {
 	case "", git.GitHub, git.Forgejo, git.Gitea, git.GitLab, git.Unknown:
 	default:

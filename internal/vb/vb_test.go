@@ -182,3 +182,31 @@ func itoa(n int) string {
 	}
 	return string(out)
 }
+
+func TestLeaseErrorsRedactTokenArgumentsAndMessages(t *testing.T) {
+	for _, args := range [][]string{{"lock", "FTR-0001", "--release", "--token", "private-token"}, {"lock", "FTR-0001", "--token=private-token", "--renew"}} {
+		err := &Error{Code: ExitLockConflict, Args: args, Message: "refused private-token"}
+		if message := err.Error(); strings.Contains(message, "private-token") || !strings.Contains(message, "[redacted]") {
+			t.Fatalf("token disclosed: %s", message)
+		}
+		if !strings.Contains(strings.Join(err.Args, " "), "private-token") {
+			t.Fatal("formatting mutated structured arguments")
+		}
+	}
+}
+
+func TestLockStatusRequiresExplicitEvidenceOfAbsence(t *testing.T) {
+	for _, data := range []string{`{}`, `null`, `{"id":"FTR-0001"}`, `{"id":"FTR-0002","locked":false}`, `{"id":"FTR-0001","locked":false,"token":"private"}`, `{"id":"FTR-0001","locked":false,"owner":"alice"}`} {
+		t.Run(data, func(t *testing.T) {
+			client, _ := fakeVB(t, "echo '{\"success\":true,\"data\":"+data+"}'")
+			if _, err := client.LockStatus(context.Background(), "FTR-0001"); err == nil || strings.Contains(err.Error(), "private") {
+				t.Fatalf("missing evidence accepted or token disclosed: %v", err)
+			}
+		})
+	}
+	client, _ := fakeVB(t, `echo '{"success":true,"data":{"id":"FTR-0001","locked":false,"expired":false}}'`)
+	lease, err := client.LockStatus(context.Background(), "FTR-0001")
+	if err != nil || lease != nil {
+		t.Fatalf("explicit unlocked result rejected: %+v %v", lease, err)
+	}
+}

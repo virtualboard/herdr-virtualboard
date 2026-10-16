@@ -35,7 +35,11 @@ type Dispatcher struct {
 
 // Request is one dispatch.
 type Request struct {
-	Spec *feature.Spec
+	// prepared is set only after nonmutating preflight in the dispatch transaction.
+	prepared     bool
+	AutoParentID string
+	AutoDepth    int
+	Spec         *feature.Spec
 	// Role overrides the suggested role. Empty means suggest one.
 	Role string
 	// Kind overrides the harness. Empty means the column's, then the
@@ -100,34 +104,124 @@ func (d *Dispatcher) Start(ctx context.Context, req Request) (*runs.Run, error) 
 	if req.Spec == nil {
 		return nil, fmt.Errorf("dispatch: no feature given")
 	}
-	// Input is validated before the gate: a typo in --harness should not
-	// need a running Herdr to be reported.
+	// Reject caller mistakes before a forced dispatch can cancel live work.
+	if err := d.validateHarness(req); err != nil {
+		return nil, err
+	}
+	var run *runs.Run
+	err := d.Store.WithRunTransaction(ctx, "@dispatch", func() error {
+		active, err := d.Store.Active()
+		if err != nil {
+			return err
+		}
+		replacing := 0
+		for _, existing := range active {
+			if existing.FeatureID == req.Spec.ID {
+				replacing++
+			}
+			if existing.FeatureID == req.Spec.ID && !req.Force {
+				return fmt.Errorf("%w: %s already has active run %s; cancel it first", ErrLocked, req.Spec.ID, existing.ID)
+			}
+		}
+		if d.Config.MaxConcurrentRuns > 0 && len(active)-replacing >= d.Config.MaxConcurrentRuns {
+			return fmt.Errorf("concurrent run limit %d reached; finish an active run or change max_concurrent_runs", d.Config.MaxConcurrentRuns)
+		}
+		// Check the replacement before stopping any currently valid run.
+		if err := d.preflight(ctx, &req); err != nil {
+			return err
+		}
+		for _, existing := range active {
+			if existing.FeatureID != req.Spec.ID {
+				continue
+			}
+			if !req.Force {
+				return fmt.Errorf("%w: %s already has active run %s; cancel it first", ErrLocked, req.Spec.ID, existing.ID)
+			}
+			if _, err := d.Cancel(ctx, existing.ID, "replaced by an explicit forced dispatch"); err != nil {
+				return err
+			}
+		}
+		active, err = d.Store.Active()
+		if err != nil {
+			return err
+		}
+		if d.Config.MaxConcurrentRuns > 0 && len(active) >= d.Config.MaxConcurrentRuns {
+			return fmt.Errorf("concurrent run limit %d reached; finish an active run or change max_concurrent_runs", d.Config.MaxConcurrentRuns)
+		}
+		run, err = d.start(ctx, req)
+		return err
+	})
+	return run, err
+}
+
+// start is called with the project-wide dispatch transaction already held.
+func (d *Dispatcher) start(ctx context.Context, req Request) (*runs.Run, error) {
+	if req.Spec == nil {
+		return nil, fmt.Errorf("dispatch: no feature given")
+	}
+	if !req.prepared {
+		if err := d.preflight(ctx, &req); err != nil {
+			return nil, err
+		}
+	}
+	// Preflight refreshed the target before resolving its role and policy.
 	column := d.Config.Column(req.Spec.Status)
 	role := d.resolveRole(req, column)
 	kind := d.resolveKind(req, column)
-	if !herdrcli.ValidKind(kind) {
-		return nil, fmt.Errorf("%w: %q is not a harness herdr can start (see `hvb harness list`)", ErrUnknownHarness, kind)
-	}
-	if err := d.Herdr.Gate(ctx); err != nil {
+	if err := d.validateHarness(req); err != nil {
 		return nil, err
+	}
+	review, err := d.reviewSource(req.Spec)
+	if err != nil {
+		return nil, err
+	}
+	if review != nil && req.Worktree != nil && !*req.Worktree {
+		return nil, fmt.Errorf("review must inspect implementation commit %s in its worktree; omit --no-worktree", review.Revision.Commit)
 	}
 
-	if err := d.claim(ctx, req); err != nil {
+	leaseToken, err := d.claim(ctx, req)
+	if err != nil {
 		return nil, err
 	}
+	fresh, err := d.Workspace.FindSpec(req.Spec.ID)
+	if err != nil || fresh.Status != req.Spec.Status {
+		d.releaseLock(ctx, req.Spec.ID, leaseToken)
+		if err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("%s changed from %s to %s before dispatch; refresh and retry", req.Spec.ID, req.Spec.Status, fresh.Status)
+	}
+	// Validate again while owning the lease: another writer could have edited
+	// the spec after preflight. The read must never use --fix.
+	client := *d.VB
+	client.LeaseToken = leaseToken
+	client.Actor = d.Config.ResolveOwner()
+	if err := validateDispatchSpec(ctx, &client, fresh); err != nil {
+		d.releaseLock(ctx, req.Spec.ID, leaseToken)
+		return nil, err
+	}
+	req.Spec = fresh
+	role = d.resolveRole(req, column)
 
 	useWorktree := d.wantsWorktree(req, column)
+	if review != nil {
+		useWorktree = true
+	}
 	wantPR := d.wantsPR(req, column, useWorktree)
 
 	run := &runs.Run{
-		ID:        runs.NewID(req.Spec.ID),
-		FeatureID: req.Spec.ID,
-		Title:     req.Spec.Title,
-		Status:    req.Spec.Status,
-		Role:      role.Key,
-		Kind:      kind,
-		State:     runs.Queued,
-		StartedAt: time.Now().UTC(),
+		ID:           runs.NewID(req.Spec.ID),
+		FeatureID:    req.Spec.ID,
+		Title:        req.Spec.Title,
+		Status:       req.Spec.Status,
+		Role:         role.Key,
+		Kind:         kind,
+		State:        runs.Queued,
+		StartedAt:    time.Now().UTC(),
+		LockToken:    leaseToken,
+		LockOwner:    d.Config.ResolveOwner(),
+		AutoParentID: req.AutoParentID,
+		AutoDepth:    req.AutoDepth,
 	}
 	if wantPR {
 		// Recorded at dispatch so a completion knows a pull request was
@@ -139,26 +233,41 @@ func (d *Dispatcher) Start(ctx context.Context, req Request) (*runs.Run, error) 
 	// dispatch happened at all, and leaving a queued run behind for a branch
 	// that was never created would be a lie.
 	if useWorktree {
-		worktree, err := d.prepareWorktree(ctx, req.Spec)
+		var worktree *runs.Worktree
+		var err error
+		if review != nil {
+			worktree, err = d.prepareReviewWorktree(ctx, req.Spec, review)
+		} else {
+			worktree, err = d.prepareWorktree(ctx, req.Spec)
+		}
 		if err != nil {
-			d.releaseLock(ctx, req.Spec.ID)
+			d.releaseLock(ctx, req.Spec.ID, leaseToken)
 			return nil, err
 		}
 		run.Worktree = worktree
+		if review != nil {
+			revision := *review.Revision
+			run.ReviewOf = &revision
+		}
 	}
 
 	if err := d.Store.Append(run); err != nil {
+		d.releaseLock(ctx, req.Spec.ID, leaseToken)
 		return nil, err
 	}
 
 	if err := d.launch(ctx, req, run, role, column, kind); err != nil {
-		if _, finishErr := d.Store.Finish(run.ID, runs.Failed, "dispatch_error", err.Error()); finishErr != nil {
-			return nil, errors.Join(err, finishErr)
-		}
-		d.releaseLock(ctx, req.Spec.ID)
-		return nil, err
+		return nil, d.failDispatch(ctx, run.ID, err)
 	}
 	return d.Store.Get(run.ID)
+}
+
+func (d *Dispatcher) validateHarness(req Request) error {
+	kind := d.resolveKind(req, d.Config.Column(req.Spec.Status))
+	if !herdrcli.ValidKind(kind) {
+		return fmt.Errorf("%w: %q is not a harness herdr can start (see `hvb harness list`)", ErrUnknownHarness, kind)
+	}
+	return nil
 }
 
 func (d *Dispatcher) launch(ctx context.Context, req Request, run *runs.Run, role roles.Role, column config.Column, kind string) error {
@@ -176,6 +285,8 @@ func (d *Dispatcher) launch(ctx context.Context, req Request, run *runs.Run, rol
 	}
 
 	env := Env(req.Spec, run.ID, role.Key, d.Workspace.Root, column)
+	env["VB_OWNER"] = run.LockOwner
+	env["VB_LOCK_TOKEN"] = run.LockToken
 	if run.Worktree != nil {
 		// The agent works in the checkout, but the board it reports to is
 		// still the one in the main repository, so the two are separate.
@@ -242,6 +353,7 @@ func (d *Dispatcher) launch(ctx context.Context, req Request, run *runs.Run, rol
 		RelPath:  d.Workspace.Rel(req.Spec.Path),
 		Worktree: run.Worktree,
 		WantPR:   run.PullRequest != nil,
+		ReviewOf: run.ReviewOf,
 	})
 	return d.submitPrompt(ctx, run.ID, agentName, prompt, blocked)
 }
@@ -360,27 +472,34 @@ func (d *Dispatcher) anchorInTab(ctx context.Context, tabID string, run *runs.Ru
 
 // claim takes the vb lock and records the owner on the feature, so a second
 // board, a second agent, or a human running `vb` sees the feature is taken.
-func (d *Dispatcher) claim(ctx context.Context, req Request) error {
+func (d *Dispatcher) claim(ctx context.Context, req Request) (string, error) {
 	if d.Config.LockTTLMinutes <= 0 {
-		return nil
+		return "", nil
 	}
 	owner := d.Config.ResolveOwner()
-	_, err := d.VB.Acquire(ctx, req.Spec.ID, owner, d.Config.LockTTLMinutes, req.Force)
+	lease, err := d.VB.Acquire(ctx, req.Spec.ID, owner, d.Config.LockTTLMinutes, req.Force)
 	if err == nil {
-		return nil
+		if lease == nil || lease.ID != req.Spec.ID || lease.Owner != owner || lease.Token == "" || lease.Expired || lease.TTLMinutes <= 0 {
+			return "", fmt.Errorf("vb returned an incomplete or mismatched lease for %s; inspect vb lock %s --status before retrying", req.Spec.ID, req.Spec.ID)
+		}
+		expiry, parseErr := time.Parse(time.RFC3339, lease.ExpiresAt)
+		if parseErr != nil || !expiry.After(time.Now()) {
+			return "", fmt.Errorf("vb returned an invalid or expired lease for %s; inspect vb lock %s --status before retrying", req.Spec.ID, req.Spec.ID)
+		}
+		return lease.Token, nil
 	}
 	var vbErr *vb.Error
 	if errors.As(err, &vbErr) && vbErr.Code == vb.ExitLockConflict {
-		return fmt.Errorf("%w: %s (retry with --force to take it)", ErrLocked, vbErr.Message)
+		return "", fmt.Errorf("%w: %s (retry with --force to take it)", ErrLocked, vbErr.Message)
 	}
-	return err
+	return "", err
 }
 
-func (d *Dispatcher) releaseLock(ctx context.Context, featureID string) {
-	if d.Config.LockTTLMinutes <= 0 {
+func (d *Dispatcher) releaseLock(ctx context.Context, featureID string, token ...string) {
+	if d.Config.LockTTLMinutes <= 0 && (len(token) == 0 || token[0] == "") {
 		return
 	}
-	_ = d.VB.Release(ctx, featureID)
+	_ = d.VB.Release(ctx, featureID, token...)
 }
 
 func (d *Dispatcher) resolveRole(req Request, column config.Column) roles.Role {

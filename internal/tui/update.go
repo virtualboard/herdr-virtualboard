@@ -13,12 +13,17 @@ import (
 // Handle applies one key press. It returns whether the board needs redrawing,
 // which is every case except an ignored key.
 func (m *Model) Handle(ctx context.Context, key Key) bool {
+	m.inputContext = ctx
+	if m.pendingLabel != "" && (m.view == ViewBoard || m.view == ViewDetail) && strings.ContainsRune("nmdexHLo", key.Rune) && key.Rune != 0 {
+		m.setError(fmt.Errorf("%s is still pending", m.pendingLabel))
+		return true
+	}
 	if key.Name == KeyCtrlC {
 		m.quitting = true
 		return true
 	}
 	switch m.view {
-	case ViewNewFeature:
+	case ViewNewFeature, ViewFilters:
 		return m.handleForm(ctx, key)
 	case ViewMovePicker, ViewDispatchPicker:
 		return m.handlePicker(ctx, key)
@@ -27,9 +32,25 @@ func (m *Model) Handle(ctx context.Context, key Key) bool {
 	case ViewDetail:
 		return m.handleDetail(ctx, key)
 	case ViewHelp:
-		if key.Name == KeyEsc || key.Rune == 'q' || key.Rune == '?' {
+		limit := max(0, len(m.helpLines())-(m.height-2))
+		offset := min(m.helpScroll, limit)
+		switch {
+		case key.Name == KeyEsc || key.Rune == 'q' || key.Rune == '?':
 			m.view = ViewBoard
+		case key.Name == KeyDown || key.Rune == 'j':
+			offset++
+		case key.Name == KeyUp || key.Rune == 'k':
+			offset--
+		case key.Name == KeyPageDown:
+			offset += max(1, m.height-4)
+		case key.Name == KeyPageUp:
+			offset -= max(1, m.height-4)
+		case key.Name == KeyHome:
+			offset = 0
+		case key.Name == KeyEnd:
+			offset = limit
 		}
+		m.helpScroll = min(max(offset, 0), limit)
 		return true
 	default:
 		return m.handleBoard(ctx, key)
@@ -56,14 +77,29 @@ func (m *Model) handleBoard(ctx context.Context, key Key) bool {
 			m.view, m.detailScroll = ViewDetail, 0
 		}
 	case key.Rune == '?':
-		m.view = ViewHelp
+		m.view, m.helpScroll = ViewHelp, 0
 	case key.Rune == 'q', key.Name == KeyEsc:
 		m.quitting = true
 	case key.Rune == 'r':
 		m.Reload(ctx)
-		m.setStatus("Refreshed.")
+		if m.enqueue == nil {
+			m.setStatus("Refreshed.")
+		}
 	case key.Name == KeyCtrlL:
 		m.Reload(ctx)
+	case key.Rune == '/', key.Rune == 'f':
+		m.openFilters()
+	case key.Rune == 'c':
+		m.applyFilters(boardFilters{})
+	case key.Rune == 'D':
+		m.hideDone = !m.hideDone
+		m.rebuildFiltered()
+		m.clampSelection()
+		if m.hideDone {
+			m.setStatus("Completed cards collapsed; D to expand.")
+		} else {
+			m.setStatus("Completed cards expanded.")
+		}
 	case key.Rune == 'n':
 		m.openNewFeature()
 	case key.Rune == 'm':
@@ -113,7 +149,7 @@ func (m *Model) handleDetail(ctx context.Context, key Key) bool {
 	case key.Rune == 'r':
 		m.Reload(ctx)
 	case key.Rune == '?':
-		m.view = ViewHelp
+		m.view, m.helpScroll = ViewHelp, 0
 	default:
 		return false
 	}
@@ -145,7 +181,6 @@ func (m *Model) handlePicker(ctx context.Context, key Key) bool {
 		if err := onChoose(chosen.Value); err != nil {
 			m.setError(err)
 		}
-		m.Reload(ctx)
 	default:
 		return false
 	}
@@ -164,7 +199,6 @@ func (m *Model) handleConfirm(ctx context.Context, key Key) bool {
 		if err := onYes(); err != nil {
 			m.setError(err)
 		}
-		m.Reload(ctx)
 	case key.Name == KeyEsc, key.Rune == 'n', key.Rune == 'q':
 		m.confirm, m.view = nil, m.returnView()
 	default:
@@ -198,7 +232,6 @@ func (m *Model) handleForm(ctx context.Context, key Key) bool {
 			return true
 		}
 		m.form, m.view = nil, ViewBoard
-		m.Reload(ctx)
 	case key.Rune != 0:
 		m.form.typeRune(key.Rune)
 	default:
@@ -281,12 +314,13 @@ func (m *Model) openMovePicker() {
 			} else if target == feature.Done || target == feature.Backlog {
 				owner = feature.Unassigned
 			}
-			if err := m.backend.Move(context.Background(), card.Spec.ID, target, owner); err != nil {
-				return err
-			}
-			m.setStatus("%s → %s", card.Spec.ID, target)
-			m.offerDispatch(card, target)
-			return nil
+			backend, id := m.backend, card.Spec.ID
+			return m.perform(m.actionContext(), "Moving "+id, true, func(ctx context.Context) (func(*Model), error) {
+				if err := backend.Move(ctx, id, target, owner); err != nil {
+					return nil, err
+				}
+				return func(model *Model) { model.setStatus("%s → %s", id, target); model.offerMovedFeature(id, target) }, nil
+			})
 		},
 	}
 	if entry, ok := p.current(); ok && entry.Disabled {
@@ -324,14 +358,14 @@ func (m *Model) shiftFocused(ctx context.Context, delta int) {
 	if status == feature.InProgress {
 		owner = m.backend.Owner()
 	}
-	if err := m.backend.Move(ctx, card.Spec.ID, status, owner); err != nil {
-		m.setError(err)
-		return
-	}
-	m.setStatus("%s → %s", card.Spec.ID, status)
-	m.Reload(ctx)
-	m.focusFeature(card.Spec.ID)
-	m.offerDispatch(card, status)
+	backend, id := m.backend, card.Spec.ID
+	err := m.perform(ctx, "Moving "+id, true, func(ctx context.Context) (func(*Model), error) {
+		if err := backend.Move(ctx, id, status, owner); err != nil {
+			return nil, err
+		}
+		return func(model *Model) { model.setStatus("%s → %s", id, status); model.offerMovedFeature(id, status) }, nil
+	})
+	m.setError(err)
 }
 
 // offerDispatch asks whether to start an agent on a feature that has just
@@ -344,6 +378,9 @@ func (m *Model) shiftFocused(ctx context.Context, delta int) {
 // a human picking up the work themselves.
 func (m *Model) offerDispatch(card *Card, status feature.Status) {
 	if status != feature.InProgress || card == nil {
+		return
+	}
+	if m.backend.Config().Column(status).Auto {
 		return
 	}
 	if card.Active != nil {
@@ -376,16 +413,14 @@ func (m *Model) offerDispatch(card *Card, status feature.Status) {
 			case dispatchPR:
 				worktree, wantPR = &yes, &yes
 			}
-			run, err := m.backend.DispatchWith(context.Background(), card.Spec, "", "", worktree, wantPR)
-			if err != nil {
-				return err
-			}
-			if run.Worktree != nil {
-				m.setStatus("Dispatched %s as %s on %s", run.FeatureID, run.Role, run.Worktree.Branch)
-				return nil
-			}
-			m.setStatus("Dispatched %s as %s in %s", run.FeatureID, run.Role, run.PaneID)
-			return nil
+			backend, spec := m.backend, cloneSpec(card.Spec)
+			return m.perform(m.actionContext(), "Dispatching "+spec.ID, true, func(ctx context.Context) (func(*Model), error) {
+				run, err := backend.DispatchWith(ctx, spec, "", "", worktree, wantPR)
+				if err != nil {
+					return nil, err
+				}
+				return dispatchNotice(run), nil
+			})
 		},
 	}
 	m.view = ViewDispatchPicker
@@ -432,6 +467,11 @@ func (m *Model) openDispatchPicker() {
 		return
 	}
 	suggested, _ := roles.Suggest(available, card.Spec, m.backend.Config().Role)
+	if columnRole := m.backend.Config().Column(card.Spec.Status).Role; columnRole != "" {
+		if role, ok := roles.Find(available, columnRole); ok {
+			suggested = role
+		}
+	}
 
 	options := make([]option, 0, len(available))
 	selected := 0
@@ -451,16 +491,14 @@ func (m *Model) openDispatchPicker() {
 		options:  options,
 		index:    selected,
 		onChoose: func(value string) error {
-			run, err := m.backend.Dispatch(context.Background(), card.Spec, value, "", false)
-			if err != nil {
-				return err
-			}
-			if run.Worktree != nil {
-				m.setStatus("Dispatched %s as %s on %s", run.FeatureID, run.Role, run.Worktree.Branch)
-				return nil
-			}
-			m.setStatus("Dispatched %s as %s in %s", run.FeatureID, run.Role, run.PaneID)
-			return nil
+			backend, spec := m.backend, cloneSpec(card.Spec)
+			return m.perform(m.actionContext(), "Dispatching "+spec.ID, true, func(ctx context.Context) (func(*Model), error) {
+				run, err := backend.Dispatch(ctx, spec, value, "", false)
+				if err != nil {
+					return nil, err
+				}
+				return dispatchNotice(run), nil
+			})
 		},
 	}
 	m.view = ViewDispatchPicker
@@ -489,17 +527,23 @@ func (m *Model) openPriorityPicker() {
 		options:  options,
 		index:    selected,
 		onChoose: func(value string) error {
-			if err := m.backend.SetField(context.Background(), card.Spec.ID, "priority", value); err != nil {
-				return err
-			}
-			m.setStatus("%s priority %s", card.Spec.ID, value)
-			return nil
+			backend, id := m.backend, card.Spec.ID
+			return m.perform(m.actionContext(), "Updating "+id, true, func(ctx context.Context) (func(*Model), error) {
+				if err := backend.SetField(ctx, id, "priority", value); err != nil {
+					return nil, err
+				}
+				return func(model *Model) { model.setStatus("%s priority %s", id, value) }, nil
+			})
 		},
 	}
 	m.view = ViewMovePicker
 }
 
 func (m *Model) openNewFeature() {
+	if m.failedForm != nil {
+		m.form, m.failedForm, m.view = m.failedForm, nil, ViewNewFeature
+		return
+	}
 	m.form = &form{
 		title: "New feature",
 		fields: []field{
@@ -513,12 +557,19 @@ func (m *Model) openNewFeature() {
 				return fmt.Errorf("a title is required")
 			}
 			labels := strings.Fields(values["labels"])
-			id, err := m.backend.Create(context.Background(), title, labels, values["priority"])
-			if err != nil {
-				return err
-			}
-			m.setStatus("Created %s", id)
-			return nil
+			backend, priority := m.backend, values["priority"]
+			return m.perform(m.actionContext(), "Creating feature", true, func(ctx context.Context) (func(*Model), error) {
+				id, err := backend.Create(ctx, title, labels, priority)
+				if err != nil {
+					if id == "" {
+						return nil, err
+					}
+					return func(model *Model) {
+						model.setError(fmt.Errorf("created %s but follow-up failed; update that feature rather than creating it again: %w", id, err))
+					}, nil
+				}
+				return func(model *Model) { model.setStatus("Created %s", id) }, nil
+			})
 		},
 	}
 	m.view = ViewNewFeature
@@ -537,11 +588,14 @@ func (m *Model) focusRun(ctx context.Context) {
 		m.setStatus("No pane to focus for %s.", card.Spec.ID)
 		return
 	}
-	if err := m.backend.Focus(ctx, run.ID); err != nil {
-		m.setError(err)
-		return
-	}
-	m.setStatus("Focused %s", run.PaneID)
+	backend, id, pane := m.backend, run.ID, run.PaneID
+	err := m.perform(ctx, "Focusing "+card.Spec.ID, false, func(ctx context.Context) (func(*Model), error) {
+		if err := backend.Focus(ctx, id); err != nil {
+			return nil, err
+		}
+		return func(model *Model) { model.setStatus("Focused %s", pane) }, nil
+	})
+	m.setError(err)
 }
 
 func (m *Model) confirmCancel() {
@@ -556,11 +610,13 @@ func (m *Model) confirmCancel() {
 		body: fmt.Sprintf("Stop the %s agent working %s and close its pane? Anything it has not committed is lost.",
 			run.Role, run.FeatureID),
 		onYes: func() error {
-			if err := m.backend.Cancel(context.Background(), run.ID); err != nil {
-				return err
-			}
-			m.setStatus("Cancelled the run on %s", run.FeatureID)
-			return nil
+			backend, id, featureID := m.backend, run.ID, run.FeatureID
+			return m.perform(m.actionContext(), "Cancelling "+featureID, true, func(ctx context.Context) (func(*Model), error) {
+				if err := backend.Cancel(ctx, id); err != nil {
+					return nil, err
+				}
+				return func(model *Model) { model.setStatus("Cancelled the run on %s", featureID) }, nil
+			})
 		},
 	}
 	m.view = ViewConfirm

@@ -138,6 +138,7 @@ make_stubs() {
 printf '%s\n' "$*" >> "$(dirname "$0")/vb.argv"
 case "$*" in
   *version*)  echo "v0.9.1"; exit 0 ;;
+  *doctor*) echo '{"success":true,"data":{"format_version":1,"ok":true,"version":"test-vb","capabilities":["owner-leases","lease-tokens","lease-renewal","raw-schema-validation","validation-exit-status"],"checks":[{"name":"runtime","ok":true,"fatal":false,"detail":"hermetic stub"}]}}'; exit 0 ;;
   *" move "*)
     id=""; status=""; owner=""
     args=($*)
@@ -167,10 +168,27 @@ case "$*" in
     echo '{"success":true,"message":"created","data":{"id":"FTR-0099","title":"stub","path":"features/backlog/FTR-0099.md","labels":[]}}'
     ;;
   *" lock "*)
-    echo '{"success":true,"message":"locked","data":{"id":"x","owner":"tester","started_at":"2026-01-01T00:00:00Z","expires_at":"2026-01-01T01:00:00Z","ttl_minutes":60,"expired":false}}'
+    id=""
+    args=("$@")
+    for i in "${!args[@]}"; do
+      if [ "${args[$i]}" = lock ]; then id="${args[$((i+1))]}"; fi
+    done
+    printf '{"success":true,"data":{"id":"%s","owner":"tester","token":"fixture-%s","expires_at":"2099-01-01T00:00:00Z","ttl_minutes":60,"expired":false}}\n' "$id" "$id"
     ;;
   *validate*)
-    echo '{"success":true,"message":"ok","data":{"target":"all","fix_applied":false,"features":{"total":1,"valid":1,"invalid":0,"results":{}},"specs":{"total":0,"valid":0,"invalid":0,"results":{}}}}'
+    target=""
+    args=("$@")
+    for i in "${!args[@]}"; do
+      if [ "${args[$i]}" = validate ]; then target="${args[$((i+1))]:-}"; fi
+    done
+    if [ -n "$target" ]; then
+      path="$(find "$VB_STUB_ROOT/.virtualboard/features" -name "$target*.md" | head -1)"
+      [ -n "$path" ] || exit 2
+      status="$(sed -n 's/^status: //p' "$path" | head -1)"
+      printf '{"success":true,"data":{"id":"%s","status":"%s","errors":[]}}\n' "$target" "$status"
+    else
+      echo '{"success":true,"data":{"features":{"total":0,"valid":0,"invalid":0,"results":{}},"specs":{"total":0,"valid":0,"invalid":0,"results":{}}}}'
+    fi
     ;;
   *)
     echo '{"success":true,"message":"ok","data":{}}'
@@ -182,6 +200,14 @@ VBSTUB
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$(dirname "$0")/herdr.argv"
 state_dir="$(dirname "$0")"
+# Model unique server-assigned pane IDs, preserving the first anchor/child as 2/3.
+next_pane_id() {
+  local current=1
+  if [ -f "$state_dir/pane-counter" ]; then read -r current < "$state_dir/pane-counter"; fi
+  current=$((current + 1))
+  printf '%s\n' "$current" > "$state_dir/pane-counter"
+  printf '%s' "$current"
+}
 case "$*" in
   *status*)
     cat <<'STATUS'
@@ -219,9 +245,10 @@ STATUS
     wt="$state_dir/worktrees/$(printf '%s' "$branch" | tr '/' '-')"
     mkdir -p "$(dirname "$wt")"
     git -C "${HERDR_STUB_CWD}" worktree add -q -b "$branch" "$wt" "${base:-main}" >/dev/null 2>&1 ||       git -C "${HERDR_STUB_CWD}" worktree add -q "$wt" "$branch" >/dev/null 2>&1
-    echo "wG:p1 wG:t1" >> "$state_dir/live_panes"
-    printf '{"id":"x","result":{"workspace":{"workspace_id":"wG","label":"ftr","worktree":{"checkout_path":"%s","is_linked_worktree":true,"repo_root":"%s"}},"tab":{"tab_id":"wG:t1","workspace_id":"wG"},"root_pane":{"pane_id":"wG:p1","tab_id":"wG:t1","workspace_id":"wG","cwd":"%s"},"worktree":{"path":"%s","branch":"%s","is_linked_worktree":true}}}\n' \
-      "$wt" "${HERDR_STUB_CWD}" "$wt" "$wt" "$branch"
+    n="$(next_pane_id)"
+    echo "wG:p$n wG:t$n" >> "$state_dir/live_panes"
+    printf '{"id":"x","result":{"workspace":{"workspace_id":"wG","label":"ftr","worktree":{"checkout_path":"%s","is_linked_worktree":true,"repo_root":"%s"}},"tab":{"tab_id":"wG:t%s","workspace_id":"wG"},"root_pane":{"pane_id":"wG:p%s","tab_id":"wG:t%s","workspace_id":"wG","cwd":"%s"},"worktree":{"path":"%s","branch":"%s","is_linked_worktree":true}}}\n' \
+      "$wt" "${HERDR_STUB_CWD}" "$n" "$n" "$n" "$wt" "$wt" "$branch"
     ;;
   *"worktree remove"*)
     echo '{"id":"x","result":{"type":"worktree_removed"}}'
@@ -233,8 +260,9 @@ STATUS
     echo '{"id":"x","result":{"tabs":[]}}'
     ;;
   *"tab create"*)
-    echo "w1:p2 w1:t2" >> "$state_dir/live_panes"
-    echo '{"id":"x","result":{"tab":{"tab_id":"w1:t2","workspace_id":"w1","label":"ftr"},"root_pane":{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1"}}}'
+    n="$(next_pane_id)"
+    echo "w1:p$n w1:t$n" >> "$state_dir/live_panes"
+    printf '{"id":"x","result":{"tab":{"tab_id":"w1:t%s","workspace_id":"w1","label":"ftr"},"root_pane":{"pane_id":"w1:p%s","tab_id":"w1:t%s","workspace_id":"w1"}}}\n' "$n" "$n" "$n"
     ;;
   *"pane list"*)
     # Render the panes this stub has actually created, so hvb's reconciliation
@@ -254,8 +282,15 @@ STATUS
     }
     ;;
   *"pane split"*)
-    echo "w1:p3 w1:t2" >> "$state_dir/live_panes"
-    echo '{"id":"x","result":{"pane":{"pane_id":"w1:p3","tab_id":"w1:t2","workspace_id":"w1"}}}'
+    n="$(next_pane_id)"
+    parent=""
+    args=("$@")
+    for i in "${!args[@]}"; do
+      if [ "${args[$i]}" = split ]; then parent="${args[$((i+1))]}"; fi
+    done
+    tab="${parent/:p/:t}"
+    echo "w1:p$n $tab" >> "$state_dir/live_panes"
+    printf '{"id":"x","result":{"pane":{"pane_id":"w1:p%s","tab_id":"%s","workspace_id":"w1"}}}\n' "$n" "$tab"
     ;;
   *"pane close"*)
     # Closing removes the pane, so a later `pane list` stops reporting it.
